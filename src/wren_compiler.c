@@ -806,7 +806,7 @@ static void nextToken(Parser* parser)
 
       case '#':
         // Ignore shebang on the first line.
-        if (peekChar(parser) == '!' && parser->currentLine == 1)
+        if ((peekChar(parser) == '!' && parser->currentLine == 1) || peekChar(parser) == ':')
         {
           skipLineComment(parser);
           break;
