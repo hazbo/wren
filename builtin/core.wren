@@ -1,6 +1,6 @@
 class Sequence {
   map(f) {
-    var result = []
+    var result = new List
     for (element in this) {
       result.add(f.call(element))
     }
@@ -8,7 +8,7 @@ class Sequence {
   }
 
   where(f) {
-    var result = []
+    var result = new List
     for (element in this) {
       if (f.call(element)) result.add(element)
     }
@@ -42,7 +42,23 @@ class Sequence {
     return result
   }
 
+  join { join("") }
+
+  join(sep) {
+    var first = true
+    var result = ""
+
+    for (element in this) {
+      if (!first) result = result + sep
+      first = false
+      result = result + element.toString
+    }
+
+    return result
+  }
 }
+
+class String is Sequence {}
 
 class List is Sequence {
   addAll(other) {
@@ -52,15 +68,7 @@ class List is Sequence {
     return other
   }
 
-  toString {
-    var result = "["
-    for (i in 0...count) {
-      if (i > 0) result = result + ", "
-      result = result + this[i].toString
-    }
-    result = result + "]"
-    return result
-  }
+  toString { "[" + join(", ") + "]" }
 
   +(other) {
     var result = this[0..-1]
@@ -78,6 +86,42 @@ class List is Sequence {
     }
     return false
   }
+}
+
+class Map {
+  keys { new MapKeySequence(this) }
+  values { new MapValueSequence(this) }
+
+  toString {
+    var first = true
+    var result = "{"
+
+    for (key in keys) {
+      if (!first) result = result + ", "
+      first = false
+      result = result + key.toString + ": " + this[key].toString
+    }
+
+    return result + "}"
+  }
+}
+
+class MapKeySequence is Sequence {
+  new(map) {
+    _map = map
+  }
+
+  iterate(n) { _map.iterate_(n) }
+  iteratorValue(iterator) { _map.keyIteratorValue_(iterator) }
+}
+
+class MapValueSequence is Sequence {
+  new(map) {
+    _map = map
+  }
+
+  iterate(n) { _map.iterate_(n) }
+  iteratorValue(iterator) { _map.valueIteratorValue_(iterator) }
 }
 
 class Range is Sequence {}

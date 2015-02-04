@@ -43,7 +43,7 @@
 static const char* libSource =
 "class Sequence {\n"
 "  map(f) {\n"
-"    var result = []\n"
+"    var result = new List\n"
 "    for (element in this) {\n"
 "      result.add(f.call(element))\n"
 "    }\n"
@@ -51,7 +51,7 @@ static const char* libSource =
 "  }\n"
 "\n"
 "  where(f) {\n"
-"    var result = []\n"
+"    var result = new List\n"
 "    for (element in this) {\n"
 "      if (f.call(element)) result.add(element)\n"
 "    }\n"
@@ -85,7 +85,23 @@ static const char* libSource =
 "    return result\n"
 "  }\n"
 "\n"
+"  join { join(\"\") }\n"
+"\n"
+"  join(sep) {\n"
+"    var first = true\n"
+"    var result = \"\"\n"
+"\n"
+"    for (element in this) {\n"
+"      if (!first) result = result + sep\n"
+"      first = false\n"
+"      result = result + element.toString\n"
+"    }\n"
+"\n"
+"    return result\n"
+"  }\n"
 "}\n"
+"\n"
+"class String is Sequence {}\n"
 "\n"
 "class List is Sequence {\n"
 "  addAll(other) {\n"
@@ -95,15 +111,7 @@ static const char* libSource =
 "    return other\n"
 "  }\n"
 "\n"
-"  toString {\n"
-"    var result = \"[\"\n"
-"    for (i in 0...count) {\n"
-"      if (i > 0) result = result + \", \"\n"
-"      result = result + this[i].toString\n"
-"    }\n"
-"    result = result + \"]\"\n"
-"    return result\n"
-"  }\n"
+"  toString { \"[\" + join(\", \") + \"]\" }\n"
 "\n"
 "  +(other) {\n"
 "    var result = this[0..-1]\n"
@@ -123,6 +131,42 @@ static const char* libSource =
 "  }\n"
 "}\n"
 "\n"
+"class Map {\n"
+"  keys { new MapKeySequence(this) }\n"
+"  values { new MapValueSequence(this) }\n"
+"\n"
+"  toString {\n"
+"    var first = true\n"
+"    var result = \"{\"\n"
+"\n"
+"    for (key in keys) {\n"
+"      if (!first) result = result + \", \"\n"
+"      first = false\n"
+"      result = result + key.toString + \": \" + this[key].toString\n"
+"    }\n"
+"\n"
+"    return result + \"}\"\n"
+"  }\n"
+"}\n"
+"\n"
+"class MapKeySequence is Sequence {\n"
+"  new(map) {\n"
+"    _map = map\n"
+"  }\n"
+"\n"
+"  iterate(n) { _map.iterate_(n) }\n"
+"  iteratorValue(iterator) { _map.keyIteratorValue_(iterator) }\n"
+"}\n"
+"\n"
+"class MapValueSequence is Sequence {\n"
+"  new(map) {\n"
+"    _map = map\n"
+"  }\n"
+"\n"
+"  iterate(n) { _map.iterate_(n) }\n"
+"  iteratorValue(iterator) { _map.valueIteratorValue_(iterator) }\n"
+"}\n"
+"\n"
 "class Range is Sequence {}\n";
 
 // Validates that the given argument in [args] is a function. Returns true if
@@ -131,7 +175,8 @@ static bool validateFn(WrenVM* vm, Value* args, int index, const char* argName)
 {
   if (IS_FN(args[index]) || IS_CLOSURE(args[index])) return true;
 
-  args[0] = OBJ_VAL(wrenStringConcat(vm, argName, " must be a function."));
+  args[0] = OBJ_VAL(wrenStringConcat(vm, argName, -1,
+                                     " must be a function.", -1));
   return false;
 }
 
@@ -141,7 +186,8 @@ static bool validateNum(WrenVM* vm, Value* args, int index, const char* argName)
 {
   if (IS_NUM(args[index])) return true;
 
-  args[0] = OBJ_VAL(wrenStringConcat(vm, argName, " must be a number."));
+  args[0] = OBJ_VAL(wrenStringConcat(vm, argName, -1,
+                                     " must be a number.", -1));
   return false;
 }
 
@@ -152,7 +198,8 @@ static bool validateIntValue(WrenVM* vm, Value* args, double value,
 {
   if (trunc(value) == value) return true;
 
-  args[0] = OBJ_VAL(wrenStringConcat(vm, argName, " must be an integer."));
+  args[0] = OBJ_VAL(wrenStringConcat(vm, argName, -1,
+                                     " must be an integer.", -1));
   return false;
 }
 
@@ -182,8 +229,23 @@ static int validateIndexValue(WrenVM* vm, Value* args, int count, double value,
   // Check bounds.
   if (index >= 0 && index < count) return index;
 
-  args[0] = OBJ_VAL(wrenStringConcat(vm, argName, " out of bounds."));
+  args[0] = OBJ_VAL(wrenStringConcat(vm, argName, -1, " out of bounds.", -1));
   return -1;
+}
+
+// Validates that [key] is a valid object for use as a map key. Returns true if
+// it is. If not, reports an error and returns false.
+static bool validateKey(WrenVM* vm, Value* args, int index)
+{
+  Value arg = args[index];
+  if (IS_BOOL(arg) || IS_CLASS(arg) || IS_NULL(arg) ||
+      IS_NUM(arg) || IS_RANGE(arg) || IS_STRING(arg))
+  {
+    return true;
+  }
+
+  args[0] = wrenNewString(vm, "Key must be a value type.", 25);
+  return false;
 }
 
 // Validates that the argument at [argIndex] is an integer within `[0, count)`.
@@ -204,7 +266,8 @@ static bool validateString(WrenVM* vm, Value* args, int index,
 {
   if (IS_STRING(args[index])) return true;
 
-  args[0] = OBJ_VAL(wrenStringConcat(vm, argName, " must be a string."));
+  args[0] = OBJ_VAL(wrenStringConcat(vm, argName, -1,
+                                     " must be a string.", -1));
   return false;
 }
 
@@ -487,23 +550,6 @@ DEF_NATIVE(fiber_yield1)
   return PRIM_RUN_FIBER;
 }
 
-static PrimitiveResult callFunction(WrenVM* vm, Value* args, int numArgs)
-{
-  ObjFn* fn;
-  if (IS_CLOSURE(args[0]))
-  {
-    fn = AS_CLOSURE(args[0])->fn;
-  }
-  else
-  {
-    fn = AS_FN(args[0]);
-  }
-
-  if (numArgs < fn->numParams) RETURN_ERROR("Function expects more arguments.");
-
-  return PRIM_CALL;
-}
-
 DEF_NATIVE(fn_instantiate)
 {
   // Return the Fn class itself. When we then call "new" on it, it will
@@ -517,6 +563,28 @@ DEF_NATIVE(fn_new)
 
   // The block argument is already a function, so just return it.
   RETURN_VAL(args[1]);
+}
+
+DEF_NATIVE(fn_arity)
+{
+  RETURN_NUM(AS_FN(args[0])->arity);
+}
+
+static PrimitiveResult callFunction(WrenVM* vm, Value* args, int numArgs)
+{
+  ObjFn* fn;
+  if (IS_CLOSURE(args[0]))
+  {
+    fn = AS_CLOSURE(args[0])->fn;
+  }
+  else
+  {
+    fn = AS_FN(args[0]);
+  }
+
+  if (numArgs < fn->arity) RETURN_ERROR("Function expects more arguments.");
+
+  return PRIM_CALL;
 }
 
 DEF_NATIVE(fn_call0) { return callFunction(vm, args, 0); }
@@ -661,6 +729,111 @@ DEF_NATIVE(list_subscriptSetter)
 
   list->elements[index] = args[2];
   RETURN_VAL(args[2]);
+}
+
+DEF_NATIVE(map_instantiate)
+{
+  RETURN_OBJ(wrenNewMap(vm));
+}
+
+DEF_NATIVE(map_subscript)
+{
+  if (!validateKey(vm, args, 1)) return PRIM_ERROR;
+
+  ObjMap* map = AS_MAP(args[0]);
+  uint32_t index = wrenMapFind(map, args[1]);
+  if (index == UINT32_MAX) RETURN_NULL;
+
+  RETURN_VAL(map->entries[index].value);
+}
+
+DEF_NATIVE(map_subscriptSetter)
+{
+  if (!validateKey(vm, args, 1)) return PRIM_ERROR;
+
+  wrenMapSet(vm, AS_MAP(args[0]), args[1], args[2]);
+  RETURN_VAL(args[2]);
+}
+
+DEF_NATIVE(map_clear)
+{
+  wrenMapClear(vm, AS_MAP(args[0]));
+  RETURN_NULL;
+}
+
+DEF_NATIVE(map_containsKey)
+{
+  if (!validateKey(vm, args, 1)) return PRIM_ERROR;
+
+  RETURN_BOOL(wrenMapFind(AS_MAP(args[0]), args[1]) != UINT32_MAX);
+}
+
+DEF_NATIVE(map_count)
+{
+  RETURN_NUM(AS_MAP(args[0])->count);
+}
+
+DEF_NATIVE(map_iterate)
+{
+  ObjMap* map = AS_MAP(args[0]);
+
+  if (map->count == 0) RETURN_FALSE;
+
+  // If we're starting the iteration, return the first entry.
+  int index = -1;
+  if (!IS_NULL(args[1]))
+  {
+    if (!validateInt(vm, args, 1, "Iterator")) return PRIM_ERROR;
+    index = (int)AS_NUM(args[1]);
+
+    if (index < 0 || index >= map->capacity) RETURN_FALSE;
+  }
+
+  // Find the next used entry, if any.
+  for (index++; index < map->capacity; index++)
+  {
+    if (!IS_UNDEFINED(map->entries[index].key)) RETURN_NUM(index);
+  }
+
+  // If we get here, walked all of the entries.
+  RETURN_FALSE;
+}
+
+DEF_NATIVE(map_remove)
+{
+  if (!validateKey(vm, args, 1)) return PRIM_ERROR;
+
+  RETURN_VAL(wrenMapRemoveKey(vm, AS_MAP(args[0]), args[1]));
+}
+
+DEF_NATIVE(map_keyIteratorValue)
+{
+  ObjMap* map = AS_MAP(args[0]);
+  int index = validateIndex(vm, args, map->capacity, 1, "Iterator");
+  if (index == -1) return PRIM_ERROR;
+
+  MapEntry* entry = &map->entries[index];
+  if (IS_UNDEFINED(entry->key))
+  {
+    RETURN_ERROR("Invalid map iterator value.");
+  }
+
+  RETURN_VAL(entry->key);
+}
+
+DEF_NATIVE(map_valueIteratorValue)
+{
+  ObjMap* map = AS_MAP(args[0]);
+  int index = validateIndex(vm, args, map->capacity, 1, "Iterator");
+  if (index == -1) return PRIM_ERROR;
+
+  MapEntry* entry = &map->entries[index];
+  if (IS_UNDEFINED(entry->key))
+  {
+    RETURN_ERROR("Invalid map iterator value.");
+  }
+
+  RETURN_VAL(entry->value);
 }
 
 DEF_NATIVE(null_not)
@@ -887,8 +1060,9 @@ DEF_NATIVE(object_toString)
   else if (IS_INSTANCE(args[0]))
   {
     ObjInstance* instance = AS_INSTANCE(args[0]);
-    RETURN_OBJ(wrenStringConcat(vm, "instance of ",
-                                instance->obj.classObj->name->value));
+    ObjString* name = instance->obj.classObj->name;
+    RETURN_OBJ(wrenStringConcat(vm, "instance of ", -1,
+                                name->value, name->length));
   }
 
   RETURN_VAL(wrenNewString(vm, "<object>", 8));
@@ -1010,7 +1184,7 @@ DEF_NATIVE(string_endsWith)
   if (search->length > string->length) RETURN_FALSE;
 
   int result = memcmp(string->value + string->length - search->length,
-                       search->value, search->length);
+                      search->value, search->length);
 
   RETURN_BOOL(result == 0);
 }
@@ -1025,6 +1199,42 @@ DEF_NATIVE(string_indexOf)
   char* firstOccurrence = strstr(string->value, search->value);
 
   RETURN_NUM(firstOccurrence ? firstOccurrence - string->value : -1);
+}
+
+DEF_NATIVE(string_iterate)
+{
+  ObjString* string = AS_STRING(args[0]);
+
+  // If we're starting the iteration, return the first index.
+  if (IS_NULL(args[1]))
+  {
+    if (string->length == 0) RETURN_FALSE;
+    RETURN_NUM(0);
+  }
+
+  if (!validateInt(vm, args, 1, "Iterator")) return PRIM_ERROR;
+
+  int index = (int)AS_NUM(args[1]);
+  if (index < 0) RETURN_FALSE;
+
+  // Advance to the beginning of the next UTF-8 sequence.
+  do
+  {
+    index++;
+    if (index >= string->length) RETURN_FALSE;
+  } while ((string->value[index] & 0xc0) == 0x80);
+
+  RETURN_NUM(index);
+}
+
+DEF_NATIVE(string_iteratorValue)
+{
+  ObjString* string = AS_STRING(args[0]);
+  int index = validateIndex(vm, args, string->length, 1, "Iterator");
+  // TODO: Test.
+  if (index == -1) return PRIM_ERROR;
+
+  RETURN_VAL(wrenStringCodePointAt(vm, string, index));
 }
 
 DEF_NATIVE(string_startsWith)
@@ -1048,25 +1258,10 @@ DEF_NATIVE(string_toString)
 DEF_NATIVE(string_plus)
 {
   if (!validateString(vm, args, 1, "Right operand")) return PRIM_ERROR;
-  RETURN_OBJ(wrenStringConcat(vm, AS_CSTRING(args[0]), AS_CSTRING(args[1])));
-}
-
-DEF_NATIVE(string_eqeq)
-{
-  if (!IS_STRING(args[1])) RETURN_FALSE;
-  ObjString* a = AS_STRING(args[0]);
-  ObjString* b = AS_STRING(args[1]);
-  RETURN_BOOL(a->length == b->length &&
-      memcmp(a->value, b->value, a->length) == 0);
-}
-
-DEF_NATIVE(string_bangeq)
-{
-  if (!IS_STRING(args[1])) RETURN_TRUE;
-  ObjString* a = AS_STRING(args[0]);
-  ObjString* b = AS_STRING(args[1]);
-  RETURN_BOOL(a->length != b->length ||
-      memcmp(a->value, b->value, a->length) != 0);
+  ObjString* left = AS_STRING(args[0]);
+  ObjString* right = AS_STRING(args[1]);
+  RETURN_OBJ(wrenStringConcat(vm, left->value, left->length,
+                              right->value, right->length));
 }
 
 DEF_NATIVE(string_subscript)
@@ -1078,13 +1273,7 @@ DEF_NATIVE(string_subscript)
     int index = validateIndex(vm, args, string->length, 1, "Subscript");
     if (index == -1) return PRIM_ERROR;
 
-    // The result is a one-character string.
-    // TODO: Handle UTF-8.
-    Value value = wrenNewUninitializedString(vm, 1);
-    ObjString* result = AS_STRING(value);
-    result->value[0] = AS_CSTRING(args[0])[index];
-    result->value[1] = '\0';
-    RETURN_VAL(value);
+    RETURN_VAL(wrenStringCodePointAt(vm, string, index));
   }
 
   if (!IS_RANGE(args[1]))
@@ -1092,6 +1281,7 @@ DEF_NATIVE(string_subscript)
     RETURN_ERROR("Subscript must be a number or a range.");
   }
 
+  // TODO: Handle UTF-8 here.
   int step;
   int count = string->length;
   int start = calculateRange(vm, args, AS_RANGE(args[1]), &count, &step);
@@ -1111,12 +1301,12 @@ static ObjClass* defineSingleClass(WrenVM* vm, const char* name)
 {
   size_t length = strlen(name);
   ObjString* nameString = AS_STRING(wrenNewString(vm, name, length));
-  WREN_PIN(vm, nameString);
+  wrenPushRoot(vm, (Obj*)nameString);
 
   ObjClass* classObj = wrenNewSingleClass(vm, 0, nameString);
   wrenDefineGlobal(vm, name, length, OBJ_VAL(classObj));
 
-  WREN_UNPIN(vm);
+  wrenPopRoot(vm);
   return classObj;
 }
 
@@ -1124,12 +1314,12 @@ static ObjClass* defineClass(WrenVM* vm, const char* name)
 {
   size_t length = strlen(name);
   ObjString* nameString = AS_STRING(wrenNewString(vm, name, length));
-  WREN_PIN(vm, nameString);
+  wrenPushRoot(vm, (Obj*)nameString);
 
   ObjClass* classObj = wrenNewClass(vm, vm->objectClass, 0, nameString);
   wrenDefineGlobal(vm, name, length, OBJ_VAL(classObj));
 
-  WREN_UNPIN(vm);
+  wrenPopRoot(vm);
   return classObj;
 }
 
@@ -1212,6 +1402,7 @@ void wrenInitializeCore(WrenVM* vm)
   NATIVE(vm->fnClass->obj.classObj, " instantiate", fn_instantiate);
   NATIVE(vm->fnClass->obj.classObj, "new ", fn_new);
 
+  NATIVE(vm->fnClass, "arity", fn_arity);
   NATIVE(vm->fnClass, "call", fn_call0);
   NATIVE(vm->fnClass, "call ", fn_call1);
   NATIVE(vm->fnClass, "call  ", fn_call2);
@@ -1229,7 +1420,6 @@ void wrenInitializeCore(WrenVM* vm)
   NATIVE(vm->fnClass, "call              ", fn_call14);
   NATIVE(vm->fnClass, "call               ", fn_call15);
   NATIVE(vm->fnClass, "call                ", fn_call16);
-  // TODO: "arity" getter.
   NATIVE(vm->fnClass, "toString", fn_toString);
 
   vm->nullClass = defineClass(vm, "Null");
@@ -1266,32 +1456,19 @@ void wrenInitializeCore(WrenVM* vm)
   NATIVE(vm->numClass, "== ", num_eqeq);
   NATIVE(vm->numClass, "!= ", num_bangeq);
 
-  vm->stringClass = defineClass(vm, "String");
+  wrenInterpret(vm, "", libSource);
+
+  vm->stringClass = AS_CLASS(findGlobal(vm, "String"));
   NATIVE(vm->stringClass, "+ ", string_plus);
-  NATIVE(vm->stringClass, "== ", string_eqeq);
-  NATIVE(vm->stringClass, "!= ", string_bangeq);
   NATIVE(vm->stringClass, "[ ]", string_subscript);
   NATIVE(vm->stringClass, "contains ", string_contains);
   NATIVE(vm->stringClass, "count", string_count);
   NATIVE(vm->stringClass, "endsWith ", string_endsWith);
   NATIVE(vm->stringClass, "indexOf ", string_indexOf);
+  NATIVE(vm->stringClass, "iterate ", string_iterate);
+  NATIVE(vm->stringClass, "iteratorValue ", string_iteratorValue);
   NATIVE(vm->stringClass, "startsWith ", string_startsWith);
   NATIVE(vm->stringClass, "toString", string_toString);
-
-  // When the base classes are defined, we allocate string objects for their
-  // names. However, we haven't created the string class itself yet, so those
-  // all have NULL class pointers. Now that we have a string class, go back and
-  // fix them up.
-  vm->objectClass->name->obj.classObj = vm->stringClass;
-  vm->classClass->name->obj.classObj = vm->stringClass;
-  vm->boolClass->name->obj.classObj = vm->stringClass;
-  vm->fiberClass->name->obj.classObj = vm->stringClass;
-  vm->fnClass->name->obj.classObj = vm->stringClass;
-  vm->nullClass->name->obj.classObj = vm->stringClass;
-  vm->numClass->name->obj.classObj = vm->stringClass;
-  vm->stringClass->name->obj.classObj = vm->stringClass;
-
-  wrenInterpret(vm, "", libSource);
 
   vm->listClass = AS_CLASS(findGlobal(vm, "List"));
   NATIVE(vm->listClass->obj.classObj, " instantiate", list_instantiate);
@@ -1305,6 +1482,19 @@ void wrenInitializeCore(WrenVM* vm)
   NATIVE(vm->listClass, "iteratorValue ", list_iteratorValue);
   NATIVE(vm->listClass, "removeAt ", list_removeAt);
 
+  vm->mapClass = AS_CLASS(findGlobal(vm, "Map"));
+  NATIVE(vm->mapClass->obj.classObj, " instantiate", map_instantiate);
+  NATIVE(vm->mapClass, "[ ]", map_subscript);
+  NATIVE(vm->mapClass, "[ ]=", map_subscriptSetter);
+  NATIVE(vm->mapClass, "clear", map_clear);
+  NATIVE(vm->mapClass, "containsKey ", map_containsKey);
+  NATIVE(vm->mapClass, "count", map_count);
+  NATIVE(vm->mapClass, "remove ", map_remove);
+  NATIVE(vm->mapClass, "iterate_ ", map_iterate);
+  NATIVE(vm->mapClass, "keyIteratorValue_ ", map_keyIteratorValue);
+  NATIVE(vm->mapClass, "valueIteratorValue_ ", map_valueIteratorValue);
+  // TODO: More map methods.
+
   vm->rangeClass = AS_CLASS(findGlobal(vm, "Range"));
   NATIVE(vm->rangeClass, "from", range_from);
   NATIVE(vm->rangeClass, "to", range_to);
@@ -1314,4 +1504,17 @@ void wrenInitializeCore(WrenVM* vm)
   NATIVE(vm->rangeClass, "iterate ", range_iterate);
   NATIVE(vm->rangeClass, "iteratorValue ", range_iteratorValue);
   NATIVE(vm->rangeClass, "toString", range_toString);
+
+  // While bootstrapping the core types and running the core library, a number
+  // string objects have been created, many of which were instantiated before
+  // stringClass was stored in the VM. Some of them *must* be created first:
+  // the ObjClass for string itself has a reference to the ObjString for its
+  // name.
+  //
+  // These all currently a NULL classObj pointer, so go back and assign them
+  // now that the string class is known.
+  for (Obj* obj = vm->first; obj != NULL; obj = obj->next)
+  {
+    if (obj->type == OBJ_STRING) obj->classObj = vm->stringClass;
+  }
 }

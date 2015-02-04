@@ -92,7 +92,7 @@ static int debugPrintInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
     {
       int global = READ_SHORT();
       printf("%-16s %5d '%s'\n", "LOAD_GLOBAL", global,
-             vm->globalNames.data[global]);
+             vm->globalNames.data[global].buffer);
       break;
     }
 
@@ -100,7 +100,7 @@ static int debugPrintInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
     {
       int global = READ_SHORT();
       printf("%-16s %5d '%s'\n", "STORE_GLOBAL", global,
-             vm->globalNames.data[global]);
+             vm->globalNames.data[global].buffer);
       break;
     }
 
@@ -110,6 +110,7 @@ static int debugPrintInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
     case CODE_STORE_FIELD: BYTE_INSTRUCTION("STORE_FIELD");
 
     case CODE_POP: printf("POP\n"); break;
+    case CODE_DUP: printf("DUP\n"); break;
 
     case CODE_CALL_0:
     case CODE_CALL_1:
@@ -132,7 +133,7 @@ static int debugPrintInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
       int numArgs = bytecode[i - 1] - CODE_CALL_0;
       int symbol = READ_SHORT();
       printf("CALL_%-11d %5d '%s'\n", numArgs, symbol,
-             vm->methodNames.data[symbol]);
+             vm->methodNames.data[symbol].buffer);
       break;
     }
 
@@ -157,7 +158,7 @@ static int debugPrintInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
       int numArgs = bytecode[i - 1] - CODE_SUPER_0;
       int symbol = READ_SHORT();
       printf("SUPER_%-10d %5d '%s'\n", numArgs, symbol,
-             vm->methodNames.data[symbol]);
+             vm->methodNames.data[symbol].buffer);
       break;
     }
 
@@ -200,13 +201,6 @@ static int debugPrintInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
     case CODE_CLOSE_UPVALUE: printf("CLOSE_UPVALUE\n"); break;
     case CODE_RETURN:        printf("CODE_RETURN\n"); break;
 
-    case CODE_LIST:
-    {
-      int length = READ_BYTE();
-      printf("%-16s %5d length\n", "LIST", length);
-      break;
-    }
-
     case CODE_CLOSURE:
     {
       int constant = READ_SHORT();
@@ -236,7 +230,7 @@ static int debugPrintInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
     {
       int symbol = READ_SHORT();
       printf("%-16s %5d '%s'\n", "METHOD_INSTANCE", symbol,
-             vm->methodNames.data[symbol]);
+             vm->methodNames.data[symbol].buffer);
       break;
     }
 
@@ -244,7 +238,7 @@ static int debugPrintInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
     {
       int symbol = READ_SHORT();
       printf("%-16s %5d '%s'\n", "METHOD_STATIC", symbol,
-             vm->methodNames.data[symbol]);
+             vm->methodNames.data[symbol].buffer);
       break;
     }
 

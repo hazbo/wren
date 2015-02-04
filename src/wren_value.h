@@ -24,10 +24,14 @@
 // Wren implementation calls these "Obj", or objects, though to a user, all
 // values are objects.
 //
-// There is also a special singleton value "undefined". It is used to identify
-// globals that have been implicitly declared by use in a forward reference but
-// not yet explicitly declared. They only exist during compilation and do not
-// appear at runtime.
+// There is also a special singleton value "undefined". It is used internally
+// but never appears as a real value to a user. It has two uses:
+//
+// - It is used to identify globals that have been implicitly declared by use
+//   in a forward reference but not yet explicitly declared. These only exist
+//   during compilation and do not appear at runtime.
+//
+// - It is used to represent unused map entries in an ObjMap.
 //
 // There are two supported Value representations. The main one uses a technique
 // called "NaN tagging" (explained in detail below) to store a number, any of
@@ -52,26 +56,19 @@ typedef enum {
   OBJ_FN,
   OBJ_INSTANCE,
   OBJ_LIST,
+  OBJ_MAP,
   OBJ_RANGE,
   OBJ_STRING,
   OBJ_UPVALUE
 } ObjType;
-
-typedef enum
-{
-  // The object has been marked during the mark phase of GC.
-  FLAG_MARKED = 0x01,
-} ObjFlags;
 
 typedef struct sObjClass ObjClass;
 
 // Base struct for all heap-allocated objects.
 typedef struct sObj
 {
-  unsigned int type  : 4; // ObjType.
-  // TODO: We could store this bit off to the side, or in the low bit of
-  // classObj to shrink objects a bit. Worth doing?
-  unsigned int flags : 1; // ObjFlags.
+  ObjType type;
+  bool marked;
 
   // The object's class.
   ObjClass* classObj;
@@ -99,8 +96,10 @@ typedef enum
 typedef struct
 {
   ValueType type;
-  double num;
-  Obj* obj;
+  union {
+    double num;
+    Obj* obj;
+  } as;
 } Value;
 
 #endif
@@ -112,7 +111,7 @@ typedef struct
   Obj obj;
   // Does not include the null terminator.
   int length;
-  char value[];
+  char value[FLEXIBLE_ARRAY];
 } ObjString;
 
 // The dynamically allocated data structure for a variable that has been used
@@ -246,7 +245,7 @@ typedef struct
   // The number of parameters this function expects. Used to ensure that .call
   // handles a mismatch between number of parameters and arguments. This will
   // only be set for fns, and not ObjFns that represent methods or scripts.
-  int numParams;
+  int arity;
   FnDebug* debug;
 } ObjFn;
 
@@ -260,7 +259,7 @@ typedef struct
   ObjFn* fn;
 
   // The upvalues this function has closed over.
-  Upvalue* upvalues[];
+  Upvalue* upvalues[FLEXIBLE_ARRAY];
 } ObjClosure;
 
 typedef enum
@@ -323,13 +322,15 @@ struct sObjClass
 typedef struct
 {
   Obj obj;
-  Value fields[];
+  Value fields[FLEXIBLE_ARRAY];
 } ObjInstance;
 
 typedef struct
 {
   Obj obj;
 
+  // TODO: Make these uint32_t to match ObjMap, or vice versa.
+  
   // The number of elements allocated.
   int capacity;
 
@@ -339,6 +340,30 @@ typedef struct
   // Pointer to a contiguous array of [capacity] elements.
   Value* elements;
 } ObjList;
+
+typedef struct
+{
+  // The entry's key, or UNDEFINED if the entry is not in use.
+  Value key;
+
+  // The value associated with the key.
+  Value value;
+} MapEntry;
+
+// A hash table mapping keys to values.
+typedef struct
+{
+  Obj obj;
+
+  // The number of entries allocated.
+  uint32_t capacity;
+
+  // The number of entries in the map.
+  uint32_t count;
+
+  // Pointer to a contiguous array of [capacity] entries.
+  MapEntry* entries;
+} ObjMap;
 
 typedef struct
 {
@@ -372,6 +397,9 @@ typedef struct
 
 // Value -> ObjList*.
 #define AS_LIST(value) ((ObjList*)AS_OBJ(value))
+
+// Value -> ObjMap*.
+#define AS_MAP(value) ((ObjMap*)AS_OBJ(value))
 
 // Value -> double.
 #define AS_NUM(value) (wrenValueToNum(value))
@@ -483,16 +511,12 @@ typedef struct
 // If the NaN bits are set, it's not a number.
 #define IS_NUM(value) (((value) & QNAN) != QNAN)
 
-// Singleton values are NaN with the sign bit cleared. (This includes the
-// normal value of the actual NaN value used in numeric arithmetic.)
-#define IS_SINGLETON(value) (((value) & (QNAN | SIGN_BIT)) == QNAN)
-
 // An object pointer is a NaN with a set sign bit.
 #define IS_OBJ(value) (((value) & (QNAN | SIGN_BIT)) == (QNAN | SIGN_BIT))
 
-#define IS_FALSE(value) ((value) == FALSE_VAL)
-#define IS_NULL(value) ((value) == (QNAN | TAG_NULL))
-#define IS_UNDEFINED(value) ((value) == (QNAN | TAG_UNDEFINED))
+#define IS_FALSE(value)     ((value) == FALSE_VAL)
+#define IS_NULL(value)      ((value) == NULL_VAL)
+#define IS_UNDEFINED(value) ((value) == UNDEFINED_VAL)
 
 // Masks out the tag bits used to identify the singleton value.
 #define MASK_TAG (7)
@@ -511,7 +535,7 @@ typedef struct
 #define AS_BOOL(value) ((value) == TRUE_VAL)
 
 // Value -> Obj*.
-#define AS_OBJ(value) ((Obj*)((value) & ~(SIGN_BIT | QNAN)))
+#define AS_OBJ(value) ((Obj*)(uintptr_t)((value) & ~(SIGN_BIT | QNAN)))
 
 // Singleton values.
 #define NULL_VAL      ((Value)(uint64_t)(QNAN | TAG_NULL))
@@ -528,23 +552,31 @@ typedef struct
 #define AS_BOOL(value) ((value).type == VAL_TRUE)
 
 // Value -> Obj*.
-#define AS_OBJ(v) ((v).obj)
+#define AS_OBJ(v) ((v).as.obj)
 
 // Determines if [value] is a garbage-collected object or not.
 #define IS_OBJ(value) ((value).type == VAL_OBJ)
 
-#define IS_FALSE(value) ((value).type == VAL_FALSE)
-#define IS_NULL(value) ((value).type == VAL_NULL)
-#define IS_NUM(value) ((value).type == VAL_NUM)
+#define IS_FALSE(value)     ((value).type == VAL_FALSE)
+#define IS_NULL(value)      ((value).type == VAL_NULL)
+#define IS_NUM(value)       ((value).type == VAL_NUM)
 #define IS_UNDEFINED(value) ((value).type == VAL_UNDEFINED)
 
 // Singleton values.
-#define FALSE_VAL     ((Value){ VAL_FALSE, 0.0, NULL })
-#define NULL_VAL      ((Value){ VAL_NULL, 0.0, NULL })
-#define TRUE_VAL      ((Value){ VAL_TRUE, 0.0, NULL })
-#define UNDEFINED_VAL ((Value){ VAL_UNDEFINED, 0.0, NULL })
+#define FALSE_VAL     ((Value){ VAL_FALSE })
+#define NULL_VAL      ((Value){ VAL_NULL })
+#define TRUE_VAL      ((Value){ VAL_TRUE })
+#define UNDEFINED_VAL ((Value){ VAL_UNDEFINED })
 
 #endif
+
+// A union to let us reinterpret a double as raw bits and back.
+typedef union
+{
+  uint64_t bits64;
+  uint32_t bits32[2];
+  double num;
+} DoubleBits;
 
 // Creates a new "raw" class. It has no metaclass or superclass whatsoever.
 // This is only used for bootstrapping the initial Object and Class classes,
@@ -575,7 +607,7 @@ ObjFiber* wrenNewFiber(WrenVM* vm, Obj* fn);
 // function will take over ownership of [bytecode] and [sourceLines]. It will
 // copy [constants] into its own array.
 ObjFn* wrenNewFunction(WrenVM* vm, Value* constants, int numConstants,
-                       int numUpvalues, int numParams,
+                       int numUpvalues, int arity,
                        uint8_t* bytecode, int bytecodeLength,
                        ObjString* debugSourcePath,
                        const char* debugName, int debugNameLength,
@@ -597,6 +629,22 @@ void wrenListInsert(WrenVM* vm, ObjList* list, Value value, int index);
 // Removes and returns the item at [index] from [list].
 Value wrenListRemoveAt(WrenVM* vm, ObjList* list, int index);
 
+// Creates a new empty map.
+ObjMap* wrenNewMap(WrenVM* vm);
+
+// Looks up [key] in [map]. If found, returns the index of its entry. Otherwise,
+// returns `UINT32_MAX`.
+uint32_t wrenMapFind(ObjMap* map, Value key);
+
+// Associates [key] with [value] in [map].
+void wrenMapSet(WrenVM* vm, ObjMap* map, Value key, Value value);
+
+void wrenMapClear(WrenVM* vm, ObjMap* map);
+
+// Removes [key] from [map], if present. Returns the value for the key if found
+// or `NULL_VAL` otherwise.
+Value wrenMapRemoveKey(WrenVM* vm, ObjMap* map, Value key);
+
 // Creates a new range from [from] to [to].
 Value wrenNewRange(WrenVM* vm, double from, double to, bool isInclusive);
 
@@ -611,8 +659,16 @@ Value wrenNewString(WrenVM* vm, const char* text, size_t length);
 // The caller is expected to fully initialize the buffer after calling.
 Value wrenNewUninitializedString(WrenVM* vm, size_t length);
 
-// Creates a new string that is the concatenation of [left] and [right].
-ObjString* wrenStringConcat(WrenVM* vm, const char* left, const char* right);
+// Creates a new string that is the concatenation of [left] and [right] (with
+// length [leftLength] and [rightLength], respectively). If -1 is passed
+// the string length is automatically calculated.
+ObjString* wrenStringConcat(WrenVM* vm, const char* left, int leftLength,
+                            const char* right, int rightLength);
+
+// Creates a new string containing the code point in [string] starting at byte
+// [index]. If [index] points into the middle of a UTF-8 sequence, returns an
+// empty string.
+Value wrenStringCodePointAt(WrenVM* vm, ObjString* string, int index);
 
 // Creates a new open upvalue pointing to [value] on the stack.
 Upvalue* wrenNewUpvalue(WrenVM* vm, Value* value);
@@ -636,9 +692,9 @@ void wrenFreeObj(WrenVM* vm, Obj* obj);
 // benchmarks.
 ObjClass* wrenGetClass(WrenVM* vm, Value value);
 
-// Returns true if [a] and [b] are strictly equal using built-in equality
-// semantics. This is identity for object values, and value equality for others.
-static inline bool wrenValuesEqual(Value a, Value b)
+// Returns true if [a] and [b] are strictly the same value. This is identity
+// for object values, and value equality for unboxed values.
+static inline bool wrenValuesSame(Value a, Value b)
 {
 #if WREN_NAN_TAGGING
   // Value types have unique bit representations and we compare object types
@@ -646,10 +702,15 @@ static inline bool wrenValuesEqual(Value a, Value b)
   return a == b;
 #else
   if (a.type != b.type) return false;
-  if (a.type == VAL_NUM) return a.num == b.num;
-  return a.obj == b.obj;
+  if (a.type == VAL_NUM) return a.as.num == b.as.num;
+  return a.as.obj == b.as.obj;
 #endif
 }
+
+// Returns true if [a] and [b] are equivalent. Immutable values (null, bools,
+// numbers, ranges, and strings) are equal if they have the same data. All
+// other values are equal if they are identical objects.
+bool wrenValuesEqual(Value a, Value b);
 
 // TODO: Need to decide if this is for user output of values, or for debug
 // tracing.
@@ -677,11 +738,16 @@ static inline bool wrenIsObjType(Value value, ObjType type)
 static inline Value wrenObjectToValue(Obj* obj)
 {
 #if WREN_NAN_TAGGING
-  return (Value)(SIGN_BIT | QNAN | (uint64_t)(obj));
+  // The triple casting is necessary here to satisfy some compilers:
+  // 1. (uintptr_t) Convert the pointer to a number of the right size.
+  // 2. (uint64_t)  Pad it up to 64 bits in 32-bit builds.
+  // 3. Or in the bits to make a tagged Nan.
+  // 4. Cast to a typedef'd value.
+  return (Value)(SIGN_BIT | QNAN | (uint64_t)(uintptr_t)(obj));
 #else
   Value value;
   value.type = VAL_OBJ;
-  value.obj = obj;
+  value.as.obj = obj;
   return value;
 #endif
 }
@@ -690,18 +756,11 @@ static inline Value wrenObjectToValue(Obj* obj)
 static inline double wrenValueToNum(Value value)
 {
 #if WREN_NAN_TAGGING
-  // Use a union to let us reinterpret the uint64_t bits back to the double
-  // value it actually stores.
-  union
-  {
-    uint64_t bits;
-    double num;
-  } data;
-
-  data.bits = value;
+  DoubleBits data;
+  data.bits64 = value;
   return data.num;
 #else
-  return value.num;
+  return value.as.num;
 #endif
 }
 
@@ -709,18 +768,14 @@ static inline double wrenValueToNum(Value value)
 static inline Value wrenNumToValue(double num)
 {
 #if WREN_NAN_TAGGING
-  // Use a union to let us reinterpret the bits making up the double as an
-  // opaque blob of bits.
-  union
-  {
-    uint64_t bits;
-    double num;
-  } data;
-
+  DoubleBits data;
   data.num = num;
-  return data.bits;
+  return data.bits64;
 #else
-  return (Value){ VAL_NUM, n, NULL };
+  Value value;
+  value.type = VAL_NUM;
+  value.as.num = num;
+  return value;
 #endif
 }
 

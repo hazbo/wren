@@ -35,6 +35,8 @@ WrenVM* wrenNewVM(WrenConfiguration* configuration)
   WrenVM* vm = (WrenVM*)reallocate(NULL, 0, sizeof(WrenVM));
 
   vm->reallocate = reallocate;
+  vm->foreignCallSlot = NULL;
+  vm->foreignCallNumArgs = 0;
 
   wrenSymbolTableInit(vm, &vm->methodNames);
   wrenSymbolTableInit(vm, &vm->globalNames);
@@ -66,10 +68,7 @@ WrenVM* wrenNewVM(WrenConfiguration* configuration)
   vm->compiler = NULL;
   vm->fiber = NULL;
   vm->first = NULL;
-  vm->pinned = NULL;
-
-  vm->foreignCallSlot = NULL;
-  vm->foreignCallNumArgs = 0;
+  vm->numTempRoots = 0;
 
   wrenInitializeCore(vm);
   #if WREN_USE_LIB_IO
@@ -132,12 +131,10 @@ static void collectGarbage(WrenVM* vm)
     wrenMarkValue(vm, vm->globals.data[i]);
   }
 
-  // Pinned objects.
-  WrenPinnedObj* pinned = vm->pinned;
-  while (pinned != NULL)
+  // Temporary roots.
+  for (int i = 0; i < vm->numTempRoots; i++)
   {
-    wrenMarkObj(vm, pinned->obj);
-    pinned = pinned->previous;
+    wrenMarkObj(vm, vm->tempRoots[i]);
   }
 
   // The current fiber.
@@ -150,7 +147,7 @@ static void collectGarbage(WrenVM* vm)
   Obj** obj = &vm->first;
   while (*obj != NULL)
   {
-    if (!((*obj)->flags & FLAG_MARKED))
+    if (!((*obj)->marked))
     {
       // This object wasn't reached, so remove it from the list and free it.
       Obj* unreached = *obj;
@@ -161,7 +158,7 @@ static void collectGarbage(WrenVM* vm)
     {
       // This object was reached, so unmark it (for the next GC) and move on to
       // the next.
-      (*obj)->flags &= ~FLAG_MARKED;
+      (*obj)->marked = false;
       obj = &(*obj)->next;
     }
   }
@@ -333,7 +330,7 @@ static ObjString* methodNotFound(WrenVM* vm, ObjClass* classObj, int symbol)
 {
   // Count the number of spaces to determine the number of parameters the
   // method expects.
-  const char* methodName = vm->methodNames.data[symbol];
+  const char* methodName = vm->methodNames.data[symbol].buffer;
 
   int methodLength = (int)strlen(methodName);
   int numParams = 0;
@@ -453,6 +450,7 @@ static bool runInterpreter(WrenVM* vm)
     &&code_LOAD_FIELD,
     &&code_STORE_FIELD,
     &&code_POP,
+    &&code_DUP,
     &&code_CALL_0,
     &&code_CALL_1,
     &&code_CALL_2,
@@ -495,7 +493,6 @@ static bool runInterpreter(WrenVM* vm)
     &&code_IS,
     &&code_CLOSE_UPVALUE,
     &&code_RETURN,
-    &&code_LIST,
     &&code_CLOSURE,
     &&code_CLASS,
     &&code_METHOD_INSTANCE,
@@ -562,6 +559,12 @@ static bool runInterpreter(WrenVM* vm)
     }
 
     CASE_CODE(POP):   DROP(); DISPATCH();
+    CASE_CODE(DUP):
+    {
+      Value value = PEEK();
+      PUSH(value); DISPATCH();
+    }
+
     CASE_CODE(NULL):  PUSH(NULL_VAL); DISPATCH();
     CASE_CODE(FALSE): PUSH(FALSE_VAL); DISPATCH();
     CASE_CODE(TRUE):  PUSH(TRUE_VAL); DISPATCH();
@@ -927,23 +930,6 @@ static bool runInterpreter(WrenVM* vm)
       DISPATCH();
     }
 
-    CASE_CODE(LIST):
-    {
-      uint8_t numElements = READ_BYTE();
-      ObjList* list = wrenNewList(vm, numElements);
-      // TODO: Do a straight memcopy.
-      for (int i = 0; i < numElements; i++)
-      {
-        list->elements[i] = *(fiber->stackTop - numElements + i);
-      }
-
-      // Discard the elements.
-      fiber->stackTop -= numElements;
-
-      PUSH(OBJ_VAL(list));
-      DISPATCH();
-    }
-
     CASE_CODE(CLOSURE):
     {
       ObjFn* prototype = AS_FN(fn->constants[READ_SHORT()]);
@@ -1049,9 +1035,9 @@ WrenInterpretResult wrenInterpret(WrenVM* vm, const char* sourcePath,
   ObjFn* fn = wrenCompile(vm, sourcePath, source);
   if (fn == NULL) return WREN_RESULT_COMPILE_ERROR;
 
-  WREN_PIN(vm, fn);
+  wrenPushRoot(vm, (Obj*)fn);
   vm->fiber = wrenNewFiber(vm, (Obj*)fn);
-  WREN_UNPIN(vm);
+  wrenPopRoot(vm);
 
   if (runInterpreter(vm))
   {
@@ -1075,7 +1061,7 @@ int wrenDefineGlobal(WrenVM* vm, const char* name, size_t length, Value value)
 {
   if (vm->globals.count == MAX_GLOBALS) return -2;
 
-  if (IS_OBJ(value)) WREN_PIN(vm, AS_OBJ(value));
+  if (IS_OBJ(value)) wrenPushRoot(vm, AS_OBJ(value));
 
   // See if the global is already explicitly or implicitly declared.
   int symbol = wrenSymbolTableFind(&vm->globalNames, name, length);
@@ -1097,21 +1083,22 @@ int wrenDefineGlobal(WrenVM* vm, const char* name, size_t length, Value value)
     symbol = -1;
   }
 
-  if (IS_OBJ(value)) WREN_UNPIN(vm);
+  if (IS_OBJ(value)) wrenPopRoot(vm);
 
   return symbol;
 }
 
-void wrenPinObj(WrenVM* vm, Obj* obj, WrenPinnedObj* pinned)
+// TODO: Inline?
+void wrenPushRoot(WrenVM* vm, Obj* obj)
 {
-  pinned->obj = obj;
-  pinned->previous = vm->pinned;
-  vm->pinned = pinned;
+  ASSERT(vm->numTempRoots < WREN_MAX_TEMP_ROOTS, "Too many temporary roots.");
+  vm->tempRoots[vm->numTempRoots++] = obj;
 }
 
-void wrenUnpinObj(WrenVM* vm)
+void wrenPopRoot(WrenVM* vm)
 {
-  vm->pinned = vm->pinned->previous;
+  ASSERT(vm->numTempRoots > 0, "No temporary roots to release.");
+  vm->numTempRoots--;
 }
 
 static void defineMethod(WrenVM* vm, const char* className,
@@ -1145,18 +1132,18 @@ static void defineMethod(WrenVM* vm, const char* className,
     size_t length = strlen(className);
     ObjString* nameString = AS_STRING(wrenNewString(vm, className, length));
 
-    WREN_PIN(vm, nameString);
+    wrenPushRoot(vm, (Obj*)nameString);
 
     // TODO: Allow passing in name for superclass?
     classObj = wrenNewClass(vm, vm->objectClass, 0, nameString);
     wrenDefineGlobal(vm, className, length, OBJ_VAL(classObj));
 
-    WREN_UNPIN(vm);
+    wrenPopRoot(vm);
   }
 
   // Create a name for the method, including its arity.
   char name[MAX_METHOD_SIGNATURE];
-  strncpy(name, methodName, length);
+  memcpy(name, methodName, length);
   for (int i = 0; i < numParams; i++)
   {
     name[length++] = ' ';
@@ -1195,7 +1182,8 @@ bool wrenGetArgumentBool(WrenVM* vm, int index)
   ASSERT(index >= 0, "index cannot be negative.");
   ASSERT(index < vm->foreignCallNumArgs, "Not that many arguments.");
 
-  // TODO: Check actual value type first.
+  if (!IS_BOOL(*(vm->foreignCallSlot + index))) return false;
+
   return AS_BOOL(*(vm->foreignCallSlot + index));
 }
 
@@ -1205,7 +1193,8 @@ double wrenGetArgumentDouble(WrenVM* vm, int index)
   ASSERT(index >= 0, "index cannot be negative.");
   ASSERT(index < vm->foreignCallNumArgs, "Not that many arguments.");
 
-  // TODO: Check actual value type first.
+  if (!IS_NUM(*(vm->foreignCallSlot + index))) return 0.0;
+
   return AS_NUM(*(vm->foreignCallSlot + index));
 }
 
@@ -1215,7 +1204,8 @@ const char* wrenGetArgumentString(WrenVM* vm, int index)
   ASSERT(index >= 0, "index cannot be negative.");
   ASSERT(index < vm->foreignCallNumArgs, "Not that many arguments.");
 
-  // TODO: Check actual value type first.
+  if (!IS_STRING(*(vm->foreignCallSlot + index))) return NULL;
+
   return AS_CSTRING(*(vm->foreignCallSlot + index));
 }
 
@@ -1235,18 +1225,11 @@ void wrenReturnDouble(WrenVM* vm, double value)
   vm->foreignCallSlot = NULL;
 }
 
-void wrenReturnNull(WrenVM* vm)
-{
-  ASSERT(vm->foreignCallSlot != NULL, "Must be in foreign call.");
-
-  *vm->foreignCallSlot = NULL_VAL;
-  vm->foreignCallSlot = NULL;
-}
-
 void wrenReturnString(WrenVM* vm, const char* text, int length)
 {
   ASSERT(vm->foreignCallSlot != NULL, "Must be in foreign call.");
-
+  ASSERT(text != NULL, "String cannot be NULL.");
+  
   size_t size = length;
   if (length == -1) size = strlen(text);
 

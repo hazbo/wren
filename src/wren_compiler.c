@@ -147,6 +147,9 @@ typedef struct
   // literal. Unlike the raw token, this will have escape sequences translated
   // to their literal equivalent.
   ByteBuffer string;
+
+  // If a number literal is currently being parsed this will hold its value.
+  double number;
 } Parser;
 
 typedef struct
@@ -511,10 +514,46 @@ static bool isKeyword(Parser* parser, const char* keyword)
       strncmp(parser->tokenStart, keyword, length) == 0;
 }
 
+// Reads the next character, which should be a hex digit (0-9, a-f, or A-F) and
+// returns its numeric value. If the character isn't a hex digit, returns -1.
+static int readHexDigit(Parser* parser)
+{
+  char c = nextChar(parser);
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+
+  // Don't consume it if it isn't expected. Keeps us from reading past the end
+  // of an unterminated string.
+  parser->currentChar--;
+  return -1;
+}
+
+// Finishes lexing a hexadecimal number literal.
+static void readHexNumber(Parser* parser)
+{
+  // Skip past the `x` used to denote a hexadecimal literal.
+  nextChar(parser);
+
+  // Iterate over all the valid hexadecimal digits found.
+  while (readHexDigit(parser) != -1) continue;
+
+  char* end;
+  parser->number = strtol(parser->tokenStart, &end, 16);
+  // TODO: Check errno == ERANGE here.
+  if (end == parser->tokenStart)
+  {
+    lexError(parser, "Invalid number literal.");
+    parser->number = 0;
+  }
+
+  makeToken(parser, TOKEN_NUMBER);
+}
+
 // Finishes lexing a number literal.
 static void readNumber(Parser* parser)
 {
-  // TODO: Hex, scientific, etc.
+  // TODO: scientific, etc.
   while (isDigit(peekChar(parser))) nextChar(parser);
 
   // See if it has a floating point. Make sure there is a digit after the "."
@@ -523,6 +562,15 @@ static void readNumber(Parser* parser)
   {
     nextChar(parser);
     while (isDigit(peekChar(parser))) nextChar(parser);
+  }
+
+  char* end;
+  parser->number = strtod(parser->tokenStart, &end);
+  // TODO: Check errno == ERANGE here.
+  if (end == parser->tokenStart)
+  {
+    lexError(parser, "Invalid number literal.");
+    parser->number = 0;
   }
 
   makeToken(parser, TOKEN_NUMBER);
@@ -557,58 +605,10 @@ static void readName(Parser* parser, TokenType type)
   makeToken(parser, type);
 }
 
-// Adds [c] to the current string literal being tokenized. If [c] is outside of
-// ASCII range, it will emit the UTF-8 encoded byte sequence for it.
-static void addStringChar(Parser* parser, uint32_t c)
+// Adds [c] to the current string literal being tokenized.
+static void addStringChar(Parser* parser, char c)
 {
-  ByteBuffer* buffer = &parser->string;
-
-  if (c <= 0x7f)
-  {
-    // Single byte (i.e. fits in ASCII).
-    wrenByteBufferWrite(parser->vm, buffer, c);
-  }
-  else if (c <= 0x7ff)
-  {
-    // Two byte sequence: 110xxxxx	 10xxxxxx.
-    wrenByteBufferWrite(parser->vm, buffer, 0xc0 | ((c & 0x7c0) >> 6));
-    wrenByteBufferWrite(parser->vm, buffer, 0x80 | (c & 0x3f));
-  }
-  else if (c <= 0xffff)
-  {
-    // Three byte sequence: 1110xxxx	 10xxxxxx 10xxxxxx.
-    wrenByteBufferWrite(parser->vm, buffer, 0xe0 | ((c & 0xf000) >> 12));
-    wrenByteBufferWrite(parser->vm, buffer, 0x80 | ((c & 0xfc0) >> 6));
-    wrenByteBufferWrite(parser->vm, buffer, 0x80 | (c & 0x3f));
-  }
-  else if (c <= 0x10ffff)
-  {
-    // Four byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx.
-    wrenByteBufferWrite(parser->vm, buffer, 0xf0 | ((c & 0x1c0000) >> 18));
-    wrenByteBufferWrite(parser->vm, buffer, 0x80 | ((c & 0x3f000) >> 12));
-    wrenByteBufferWrite(parser->vm, buffer, 0x80 | ((c & 0xfc0) >> 6));
-    wrenByteBufferWrite(parser->vm, buffer, 0x80 | (c & 0x3f));
-  }
-  else
-  {
-    // Invalid Unicode value. See: http://tools.ietf.org/html/rfc3629
-    // TODO: Error.
-  }
-}
-
-// Reads the next character, which should be a hex digit (0-9, a-f, or A-F) and
-// returns its numeric value. If the character isn't a hex digit, returns -1.
-static int readHexDigit(Parser* parser)
-{
-  char c = nextChar(parser);
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-
-  // Don't consume it if it isn't expected. Keeps us from reading past the end
-  // of an unterminated string.
-  parser->currentChar--;
-  return -1;
+  wrenByteBufferWrite(parser->vm, &parser->string, c);
 }
 
 // Reads a four hex digit Unicode escape sequence in a string literal.
@@ -627,7 +627,7 @@ static void readUnicodeEscape(Parser* parser)
       break;
     }
 
-    char digit = readHexDigit(parser);
+    int digit = readHexDigit(parser);
     if (digit == -1)
     {
       lexError(parser, "Invalid Unicode escape sequence.");
@@ -637,7 +637,40 @@ static void readUnicodeEscape(Parser* parser)
     value = (value * 16) | digit;
   }
 
-  addStringChar(parser, value);
+  ByteBuffer* buffer = &parser->string;
+
+  // UTF-8 encode the value.
+  if (value <= 0x7f)
+  {
+    // Single byte (i.e. fits in ASCII).
+    wrenByteBufferWrite(parser->vm, buffer, value);
+  }
+  else if (value <= 0x7ff)
+  {
+    // Two byte sequence: 110xxxxx	 10xxxxxx.
+    wrenByteBufferWrite(parser->vm, buffer, 0xc0 | ((value & 0x7c0) >> 6));
+    wrenByteBufferWrite(parser->vm, buffer, 0x80 | (value & 0x3f));
+  }
+  else if (value <= 0xffff)
+  {
+    // Three byte sequence: 1110xxxx	 10xxxxxx 10xxxxxx.
+    wrenByteBufferWrite(parser->vm, buffer, 0xe0 | ((value & 0xf000) >> 12));
+    wrenByteBufferWrite(parser->vm, buffer, 0x80 | ((value & 0xfc0) >> 6));
+    wrenByteBufferWrite(parser->vm, buffer, 0x80 | (value & 0x3f));
+  }
+  else if (value <= 0x10ffff)
+  {
+    // Four byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx.
+    wrenByteBufferWrite(parser->vm, buffer, 0xf0 | ((value & 0x1c0000) >> 18));
+    wrenByteBufferWrite(parser->vm, buffer, 0x80 | ((value & 0x3f000) >> 12));
+    wrenByteBufferWrite(parser->vm, buffer, 0x80 | ((value & 0xfc0) >> 6));
+    wrenByteBufferWrite(parser->vm, buffer, 0x80 | (value & 0x3f));
+  }
+  else
+  {
+    // Invalid Unicode value. See: http://tools.ietf.org/html/rfc3629
+    // TODO: Error.
+  }
 }
 
 // Finishes lexing a string literal.
@@ -666,6 +699,7 @@ static void readString(Parser* parser)
       {
         case '"':  addStringChar(parser, '"'); break;
         case '\\': addStringChar(parser, '\\'); break;
+        case '0':  addStringChar(parser, '\0'); break;
         case 'a':  addStringChar(parser, '\a'); break;
         case 'b':  addStringChar(parser, '\b'); break;
         case 'f':  addStringChar(parser, '\f'); break;
@@ -813,6 +847,16 @@ static void nextToken(Parser* parser)
         }
 
         lexError(parser, "Invalid character '%c'.", c);
+        return;
+
+      case '0':
+        if (peekChar(parser) == 'x')
+        {
+          readHexNumber(parser);
+          return;
+        }
+
+        readNumber(parser);
         return;
 
       default:
@@ -1221,7 +1265,8 @@ static int copyName(Compiler* compiler, char* name)
     length = MAX_METHOD_NAME;
   }
 
-  strncpy(name, token->start, length);
+  memcpy(name, token->start, length);
+  name[length] = '\0';
   return length;
 }
 
@@ -1258,7 +1303,7 @@ static ObjFn* endCompiler(Compiler* compiler,
                               compiler->parser->sourcePath,
                               debugName, debugNameLength,
                               compiler->debugSourceLines.data);
-  WREN_PIN(compiler->parser->vm, fn);
+  wrenPushRoot(compiler->parser->vm, (Obj*)fn);
 
   // In the function that contains this one, load the resulting function object.
   if (compiler->parent != NULL)
@@ -1290,7 +1335,7 @@ static ObjFn* endCompiler(Compiler* compiler,
   // Pop this compiler off the stack.
   wrenSetCompiler(compiler->parser->vm, compiler->parent);
 
-  WREN_UNPIN(compiler->parser->vm);
+  wrenPopRoot(compiler->parser->vm);
 
   #if WREN_DEBUG_DUMP_COMPILED_CODE
     wrenDebugPrintCode(compiler->parser->vm, fn);
@@ -1315,7 +1360,8 @@ typedef enum
   PREC_TERM,       // + -
   PREC_FACTOR,     // * / %
   PREC_UNARY,      // unary - ! ~
-  PREC_CALL        // . () []
+  PREC_CALL,       // . () []
+  PREC_PRIMARY
 } Precedence;
 
 typedef void (*GrammarFn)(Compiler*, bool allowAssignment);
@@ -1424,16 +1470,13 @@ static void validateNumParameters(Compiler* compiler, int numArgs)
   }
 }
 
-// Parses an optional parenthesis-delimited parameter list. If the parameter
-// list is for a method, [name] will be the name of the method and this will
-// modify it to handle arity in the signature. For functions, [name] will be
-// `null`.
-static int parameterList(Compiler* compiler, char* name, int* length,
-                         TokenType startToken, TokenType endToken)
+// Parses the rest of a parameter list after the opening delimeter, and closed
+// by [endToken]. If the parameter list is for a method, [name] will be the
+// name of the method and this will modify it to handle arity in the signature.
+// For functions, [name] will be `null`.
+static int finishParameterList(Compiler* compiler, char* name, int* length,
+                               TokenType endToken)
 {
-  // The parameter list is optional.
-  if (!match(compiler, startToken)) return 0;
-
   int numParams = 0;
   do
   {
@@ -1448,11 +1491,32 @@ static int parameterList(Compiler* compiler, char* name, int* length,
   }
   while (match(compiler, TOKEN_COMMA));
 
-  const char* message = (endToken == TOKEN_RIGHT_PAREN) ?
-      "Expect ')' after parameters." : "Expect '|' after parameters.";
+  const char* message;
+  switch (endToken)
+  {
+    case TOKEN_RIGHT_PAREN:   message = "Expect ')' after parameters."; break;
+    case TOKEN_RIGHT_BRACKET: message = "Expect ']' after parameters."; break;
+    case TOKEN_PIPE:          message = "Expect '|' after parameters."; break;
+    default:
+      message = NULL;
+      UNREACHABLE();
+  }
+
   consume(compiler, endToken, message);
 
   return numParams;
+}
+
+// Parses an optional delimited parameter list. If the parameter list is for a
+// method, [name] will be the name of the method and this will modify it to
+// handle arity in the signature. For functions, [name] will be `null`.
+static int parameterList(Compiler* compiler, char* name, int* length,
+                         TokenType startToken, TokenType endToken)
+{
+  // The parameter list is optional.
+  if (!match(compiler, startToken)) return 0;
+
+  return finishParameterList(compiler, name, length, endToken);
 }
 
 // Gets the symbol for a method [name]. If [length] is 0, it will be calculated
@@ -1528,7 +1592,6 @@ static void namedCall(Compiler* compiler, bool allowAssignment,
     ignoreNewlines(compiler);
 
     name[length++] = '=';
-    name[length++] = ' ';
 
     // Compile the assigned value.
     expression(compiler);
@@ -1557,33 +1620,96 @@ static void loadThis(Compiler* compiler)
   }
 }
 
+// A parenthesized expression.
 static void grouping(Compiler* compiler, bool allowAssignment)
 {
   expression(compiler);
   consume(compiler, TOKEN_RIGHT_PAREN, "Expect ')' after expression.");
 }
 
+// A list literal.
 static void list(Compiler* compiler, bool allowAssignment)
 {
-  // Compile the list elements.
-  int numElements = 0;
+  // Load the List class.
+  int listClassSymbol = wrenSymbolTableFind(&compiler->parser->vm->globalNames,
+                                            "List", 4);
+  ASSERT(listClassSymbol != -1, "Should have already defined 'List' global.");
+  emitShortArg(compiler, CODE_LOAD_GLOBAL, listClassSymbol);
+
+  // Instantiate a new list.
+  emitShortArg(compiler, CODE_CALL_0,
+               methodSymbol(compiler, " instantiate", 12));
+
+  int addSymbol = methodSymbol(compiler, "add ", 4);
+
+  // Compile the list elements. Each one compiles to a ".add()" call.
   if (peek(compiler) != TOKEN_RIGHT_BRACKET)
   {
     do
     {
       ignoreNewlines(compiler);
-      numElements++;
+
+      // Push a copy of the list since the add() call will consume it.
+      emit(compiler, CODE_DUP);
+
+      // The element.
       expression(compiler);
+
+      emitShortArg(compiler, CODE_CALL_1, addSymbol);
+
+      // Discard the result of the add() call.
+      emit(compiler, CODE_POP);
     } while (match(compiler, TOKEN_COMMA));
   }
 
   // Allow newlines before the closing ']'.
   ignoreNewlines(compiler);
   consume(compiler, TOKEN_RIGHT_BRACKET, "Expect ']' after list elements.");
+}
 
-  // Create the list.
-  // TODO: Handle lists >255 elements.
-  emitByteArg(compiler, CODE_LIST, numElements);
+// A map literal.
+static void map(Compiler* compiler, bool allowAssignment)
+{
+  // Load the Map class.
+  int mapClassSymbol = wrenSymbolTableFind(&compiler->parser->vm->globalNames,
+                                           "Map", 3);
+  ASSERT(mapClassSymbol != -1, "Should have already defined 'Map' global.");
+  emitShortArg(compiler, CODE_LOAD_GLOBAL, mapClassSymbol);
+
+  // Instantiate a new map.
+  emitShortArg(compiler, CODE_CALL_0,
+               methodSymbol(compiler, " instantiate", 12));
+
+  int subscriptSetSymbol = methodSymbol(compiler, "[ ]=", 4);
+
+  // Compile the map elements. Each one is compiled to just invoke the
+  // subscript setter on the map.
+  if (peek(compiler) != TOKEN_RIGHT_BRACE)
+  {
+    do
+    {
+      ignoreNewlines(compiler);
+
+      // Push a copy of the map since the subscript call will consume it.
+      emit(compiler, CODE_DUP);
+
+      // The key.
+      parsePrecedence(compiler, false, PREC_PRIMARY);
+      consume(compiler, TOKEN_COLON, "Expect ':' after map key.");
+
+      // The value.
+      expression(compiler);
+
+      emitShortArg(compiler, CODE_CALL_2, subscriptSetSymbol);
+
+      // Discard the result of the setter call.
+      emit(compiler, CODE_POP);
+    } while (match(compiler, TOKEN_COMMA));
+  }
+
+  // Allow newlines before the closing '}'.
+  ignoreNewlines(compiler);
+  consume(compiler, TOKEN_RIGHT_BRACE, "Expect '}' after map entries.");
 }
 
 // Unary operators like `-foo`.
@@ -1831,19 +1957,7 @@ static void null(Compiler* compiler, bool allowAssignment)
 
 static void number(Compiler* compiler, bool allowAssignment)
 {
-  Token* token = &compiler->parser->previous;
-  char* end;
-
-  double value = strtod(token->start, &end);
-  // TODO: Check errno == ERANGE here.
-  if (end == token->start)
-  {
-    error(compiler, "Invalid number literal.");
-    value = 0;
-  }
-
-  // Define a constant for the literal.
-  int constant = addConstant(compiler, NUM_VAL(value));
+  int constant = addConstant(compiler, NUM_VAL(compiler->parser->number));
 
   // Compile the code to load the constant.
   emitShortArg(compiler, CODE_CONSTANT, constant);
@@ -1892,14 +2006,14 @@ static void super_(Compiler* compiler, bool allowAssignment)
     int length;
     if (enclosingClass != NULL) {
       length = enclosingClass->methodLength;
-      strncpy(name, enclosingClass->methodName, length);
+      memcpy(name, enclosingClass->methodName, length);
     } else {
       // We get here if super is used outside of a method. In that case, we
       // have already reported the error, so just stub this out so we can keep
       // going to try to find later errors.
       length = 0;
-      strncpy(name, "", length);
     }
+    name[length] = '\0';
 
     // Call the superclass method with the same name.
     methodCall(compiler, CODE_SUPER_0, name, length);
@@ -1985,8 +2099,7 @@ static void new_(Compiler* compiler, bool allowAssignment)
                methodSymbol(compiler, " instantiate", 12));
 
   // Invoke the constructor on the new instance.
-  char name[MAX_METHOD_SIGNATURE];
-  strcpy(name, "new");
+  char name[MAX_METHOD_SIGNATURE] = "new";
   methodCall(compiler, CODE_CALL_0, name, 3);
 }
 
@@ -2095,25 +2208,42 @@ void mixedSignature(Compiler* compiler, char* name, int* length)
   }
 }
 
+// Compiles an optional setter parameter in a method signature.
+//
+// Returns `true` if it was a setter.
+static bool maybeSetter(Compiler* compiler, char* name, int* length)
+{
+  // See if it's a setter.
+  if (!match(compiler, TOKEN_EQ)) return false;
+
+  // It's a setter.
+  name[(*length)++] = '=';
+
+  // Parse the value parameter.
+  consume(compiler, TOKEN_LEFT_PAREN, "Expect '(' after '='.");
+  declareNamedVariable(compiler);
+  consume(compiler, TOKEN_RIGHT_PAREN, "Expect ')' after parameter name.");
+  return true;
+}
+
+// Compiles a method signature for a subscript operator.
+void subscriptSignature(Compiler* compiler, char* name, int* length)
+{
+  // Parse the parameters inside the subscript.
+  finishParameterList(compiler, name, length, TOKEN_RIGHT_BRACKET);
+  name[(*length)++] = ']';
+
+  maybeSetter(compiler, name, length);
+}
+
 // Compiles a method signature for a named method or setter.
 void namedSignature(Compiler* compiler, char* name, int* length)
 {
-  if (match(compiler, TOKEN_EQ))
-  {
-    // It's a setter.
-    name[(*length)++] = '=';
-    name[(*length)++] = ' ';
+  // If it's a setter, it can't also have a parameter list.
+  if (maybeSetter(compiler, name, length)) return;
 
-    // Parse the value parameter.
-    consume(compiler, TOKEN_LEFT_PAREN, "Expect '(' after '='.");
-    declareNamedVariable(compiler);
-    consume(compiler, TOKEN_RIGHT_PAREN, "Expect ')' after parameter name.");
-  }
-  else
-  {
-    // Regular named method with an optional parameter list.
-    parameterList(compiler, name, length, TOKEN_LEFT_PAREN, TOKEN_RIGHT_PAREN);
-  }
+  // Regular named method with an optional parameter list.
+  parameterList(compiler, name, length, TOKEN_LEFT_PAREN, TOKEN_RIGHT_PAREN);
 }
 
 // Compiles a method signature for a constructor.
@@ -2138,9 +2268,9 @@ GrammarRule rules[] =
 {
   /* TOKEN_LEFT_PAREN    */ PREFIX(grouping),
   /* TOKEN_RIGHT_PAREN   */ UNUSED,
-  /* TOKEN_LEFT_BRACKET  */ { list, subscript, NULL, PREC_CALL, NULL },
+  /* TOKEN_LEFT_BRACKET  */ { list, subscript, subscriptSignature, PREC_CALL, NULL },
   /* TOKEN_RIGHT_BRACKET */ UNUSED,
-  /* TOKEN_LEFT_BRACE    */ UNUSED,
+  /* TOKEN_LEFT_BRACE    */ PREFIX(map),
   /* TOKEN_RIGHT_BRACE   */ UNUSED,
   /* TOKEN_COLON         */ UNUSED,
   /* TOKEN_DOT           */ INFIX(PREC_CALL, call),
@@ -2149,7 +2279,7 @@ GrammarRule rules[] =
   /* TOKEN_COMMA         */ UNUSED,
   /* TOKEN_STAR          */ INFIX_OPERATOR(PREC_FACTOR, "* "),
   /* TOKEN_SLASH         */ INFIX_OPERATOR(PREC_FACTOR, "/ "),
-  /* TOKEN_PERCENT       */ INFIX_OPERATOR(PREC_TERM, "% "),
+  /* TOKEN_PERCENT       */ INFIX_OPERATOR(PREC_FACTOR, "% "),
   /* TOKEN_PLUS          */ INFIX_OPERATOR(PREC_TERM, "+ "),
   /* TOKEN_MINUS         */ OPERATOR("- "),
   /* TOKEN_PIPE          */ INFIX_OPERATOR(PREC_BITWISE, "| "),
@@ -2263,6 +2393,7 @@ static int getNumArguments(const uint8_t* bytecode, const Value* constants,
     case CODE_FALSE:
     case CODE_TRUE:
     case CODE_POP:
+    case CODE_DUP:
     case CODE_IS:
     case CODE_CLOSE_UPVALUE:
     case CODE_RETURN:
@@ -2286,7 +2417,6 @@ static int getNumArguments(const uint8_t* bytecode, const Value* constants,
     case CODE_STORE_FIELD_THIS:
     case CODE_LOAD_FIELD:
     case CODE_STORE_FIELD:
-    case CODE_LIST:
     case CODE_CLASS:
       return 1;
 
@@ -2542,7 +2672,10 @@ void statement(Compiler* compiler)
     return;
   }
 
-  if (match(compiler, TOKEN_FOR)) return forStatement(compiler);
+  if (match(compiler, TOKEN_FOR)) {
+    forStatement(compiler);
+    return;
+  }
 
   if (match(compiler, TOKEN_IF))
   {
@@ -2595,7 +2728,10 @@ void statement(Compiler* compiler)
     return;
   }
 
-  if (match(compiler, TOKEN_WHILE)) return whileStatement(compiler);
+  if (match(compiler, TOKEN_WHILE)) {
+    whileStatement(compiler);
+    return;
+  }
 
   // Expression statement.
   expression(compiler);
@@ -2764,8 +2900,15 @@ static void variableDefinition(Compiler* compiler)
 // like the non-curly body of an if or while.
 void definition(Compiler* compiler)
 {
-  if (match(compiler, TOKEN_CLASS)) return classDefinition(compiler);
-  if (match(compiler, TOKEN_VAR)) return variableDefinition(compiler);
+  if (match(compiler, TOKEN_CLASS)) {
+    classDefinition(compiler);
+    return;
+  }
+
+  if (match(compiler, TOKEN_VAR)) {
+    variableDefinition(compiler);
+    return;
+  }
 
   block(compiler);
 }
@@ -2776,7 +2919,7 @@ ObjFn* wrenCompile(WrenVM* vm, const char* sourcePath, const char* source)
 {
   ObjString* sourcePathObj = AS_STRING(wrenNewString(vm, sourcePath,
                                                      strlen(sourcePath)));
-  WREN_PIN(vm, sourcePathObj);
+  wrenPushRoot(vm, (Obj*)sourcePathObj);
 
   Parser parser;
   parser.vm = vm;
@@ -2807,7 +2950,7 @@ ObjFn* wrenCompile(WrenVM* vm, const char* sourcePath, const char* source)
   initCompiler(&compiler, &parser, NULL, true);
   ignoreNewlines(&compiler);
 
-  WREN_UNPIN(vm);
+  wrenPopRoot(vm);
 
   while (!match(&compiler, TOKEN_EOF))
   {
