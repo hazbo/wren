@@ -2,7 +2,6 @@
 #define wren_value_h
 
 #include <stdbool.h>
-#include <stdint.h>
 
 #include "wren_common.h"
 #include "wren_utils.h"
@@ -13,7 +12,7 @@
 // critical for performance.
 //
 // The main type exposed by this is [Value]. A C variable of that type is a
-// storage location that can hold any Wren value. The stack, global variables,
+// storage location that can hold any Wren value. The stack, module variables,
 // and instance fields are all implemented in C as variables of type Value.
 //
 // The built-in types for booleans, numbers, and null are unboxed: their value
@@ -27,9 +26,9 @@
 // There is also a special singleton value "undefined". It is used internally
 // but never appears as a real value to a user. It has two uses:
 //
-// - It is used to identify globals that have been implicitly declared by use
-//   in a forward reference but not yet explicitly declared. These only exist
-//   during compilation and do not appear at runtime.
+// - It is used to identify module variables that have been implicitly declared
+//   by use in a forward reference but not yet explicitly declared. These only
+//   exist during compilation and do not appear at runtime.
 //
 // - It is used to represent unused map entries in an ObjMap.
 //
@@ -39,7 +38,7 @@
 // point value. A larger, slower, Value type that uses a struct to store these
 // is also supported, and is useful for debugging the VM.
 //
-// The representation is controlled by the `NAN_TAGGING` define. If that's
+// The representation is controlled by the `WREN_NAN_TAGGING` define. If that's
 // defined, Nan tagging is used.
 
 // TODO: Make these externally controllable.
@@ -57,6 +56,7 @@ typedef enum {
   OBJ_INSTANCE,
   OBJ_LIST,
   OBJ_MAP,
+  OBJ_MODULE,
   OBJ_RANGE,
   OBJ_STRING,
   OBJ_UPVALUE
@@ -110,7 +110,7 @@ typedef struct
 {
   Obj obj;
   // Does not include the null terminator.
-  int length;
+  uint32_t length;
   char value[FLEXIBLE_ARRAY];
 } ObjString;
 
@@ -225,6 +225,22 @@ typedef struct
   int* sourceLines;
 } FnDebug;
 
+// A loaded module and the top-level variables it defines.
+//
+// While this is an Obj and is managed by the GC, it never appears as a
+// first-class object in Wren.
+typedef struct
+{
+  Obj obj;
+
+  // The currently defined top-level variables.
+  ValueBuffer variables;
+
+  // Symbol table for the names of all module variables. Indexes here directly
+  // correspond to entries in [variables].
+  SymbolTable variableNames;
+} ObjModule;
+
 // A first-class function object. A raw ObjFn can be used and invoked directly
 // if it has no upvalues (i.e. [numUpvalues] is zero). If it does use upvalues,
 // it must be wrapped in an [ObjClosure] first. The compiler is responsible for
@@ -236,6 +252,10 @@ typedef struct
   // to help perf, but it bears more investigation.
   Value* constants;
   uint8_t* bytecode;
+
+  // The module where this function was defined.
+  ObjModule* module;
+
   int numUpvalues;
   int numConstants;
 
@@ -343,14 +363,32 @@ typedef struct
 
 typedef struct
 {
-  // The entry's key, or UNDEFINED if the entry is not in use.
+  // The entry's key, or UNDEFINED_VAL if the entry is not in use.
   Value key;
 
-  // The value associated with the key.
+  // The value associated with the key. If the key is UNDEFINED_VAL, this will
+  // be false to indicate an open available entry or true to indicate a
+  // tombstone -- an entry that was previously in use but was then deleted.
   Value value;
 } MapEntry;
 
 // A hash table mapping keys to values.
+//
+// We use something very simple: open addressing with linear probing. The hash
+// table is an array of entries. Each entry is a key-value pair. If the key is
+// the special UNDEFINED_VAL, it indicates no value is currently in that slot.
+// Otherwise, it's a valid key, and the value is the value associated with it.
+//
+// When entries are added, the array is dynamically scaled by GROW_FACTOR to
+// keep the number of filled slots under MAP_LOAD_PERCENT. Likewise, if the map
+// gets empty enough, it will be resized to a smaller array. When this happens,
+// all existing entries are rehashed and re-added to the new array.
+//
+// When an entry is removed, its slot is replaced with a "tombstone". This is an
+// entry whose key is UNDEFINED_VAL and whose value is TRUE_VAL. When probing
+// for a key, we will continue past tombstones, because the desired key may be
+// found after them if the key that was removed was part of a prior collision.
+// When the array gets resized, all tombstones are discarded.
 typedef struct
 {
   Obj obj;
@@ -401,6 +439,9 @@ typedef struct
 // Value -> ObjMap*.
 #define AS_MAP(value) ((ObjMap*)AS_OBJ(value))
 
+// Value -> ObjModule*.
+#define AS_MODULE(value) ((ObjModule*)AS_OBJ(value))
+
 // Value -> double.
 #define AS_NUM(value) (wrenValueToNum(value))
 
@@ -430,6 +471,9 @@ typedef struct
 
 // Returns true if [value] is a closure.
 #define IS_CLOSURE(value) (wrenIsObjType(value, OBJ_CLOSURE))
+
+// Returns true if [value] is a fiber.
+#define IS_FIBER(value) (wrenIsObjType(value, OBJ_FIBER))
 
 // Returns true if [value] is a function object.
 #define IS_FN(value) (wrenIsObjType(value, OBJ_FN))
@@ -602,11 +646,15 @@ ObjClosure* wrenNewClosure(WrenVM* vm, ObjFn* fn);
 // closure.
 ObjFiber* wrenNewFiber(WrenVM* vm, Obj* fn);
 
+// Resets [fiber] back to an initial state where it is ready to invoke [fn].
+void wrenResetFiber(ObjFiber* fiber, Obj* fn);
+
 // TODO: The argument list here is getting a bit gratuitous.
 // Creates a new function object with the given code and constants. The new
 // function will take over ownership of [bytecode] and [sourceLines]. It will
 // copy [constants] into its own array.
-ObjFn* wrenNewFunction(WrenVM* vm, Value* constants, int numConstants,
+ObjFn* wrenNewFunction(WrenVM* vm, ObjModule* module,
+                       Value* constants, int numConstants,
                        int numUpvalues, int arity,
                        uint8_t* bytecode, int bytecodeLength,
                        ObjString* debugSourcePath,
@@ -645,6 +693,9 @@ void wrenMapClear(WrenVM* vm, ObjMap* map);
 // or `NULL_VAL` otherwise.
 Value wrenMapRemoveKey(WrenVM* vm, ObjMap* map, Value key);
 
+// Creates a new module.
+ObjModule* wrenNewModule(WrenVM* vm);
+
 // Creates a new range from [from] to [to].
 Value wrenNewRange(WrenVM* vm, double from, double to, bool isInclusive);
 
@@ -668,7 +719,12 @@ ObjString* wrenStringConcat(WrenVM* vm, const char* left, int leftLength,
 // Creates a new string containing the code point in [string] starting at byte
 // [index]. If [index] points into the middle of a UTF-8 sequence, returns an
 // empty string.
-Value wrenStringCodePointAt(WrenVM* vm, ObjString* string, int index);
+Value wrenStringCodePointAt(WrenVM* vm, ObjString* string, uint32_t index);
+
+// Search for the first occurence of [needle] within [haystack] and returns its
+// zero-based offset. Returns `UINT32_MAX` if [haystack] does not contain
+// [needle].
+uint32_t wrenStringFind(WrenVM* vm, ObjString* haystack, ObjString* needle);
 
 // Creates a new open upvalue pointing to [value] on the stack.
 Upvalue* wrenNewUpvalue(WrenVM* vm, Value* value);

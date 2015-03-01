@@ -2,10 +2,14 @@
 #define wren_h
 
 #include <stdlib.h>
-#include <stdint.h>
 #include <stdbool.h>
 
 typedef struct WrenVM WrenVM;
+
+// A handle to a method, bound to a receiver.
+//
+// This is used to call a Wren method on some object from C code.
+typedef struct WrenMethod WrenMethod;
 
 // A generic allocation function that handles all explicit memory management
 // used by Wren. It's used like so:
@@ -25,7 +29,11 @@ typedef struct WrenVM WrenVM;
 //   [oldSize] will be zero. It should return NULL.
 typedef void* (*WrenReallocateFn)(void* memory, size_t oldSize, size_t newSize);
 
+// A function callable from Wren code, but implemented in C.
 typedef void (*WrenForeignMethodFn)(WrenVM* vm);
+
+// Loads and returns the source code for the module [name].
+typedef char* (*WrenLoadModuleFn)(WrenVM* vm, const char* name);
 
 typedef struct
 {
@@ -33,6 +41,23 @@ typedef struct
   //
   // If `NULL`, defaults to a built-in function that uses `realloc` and `free`.
   WrenReallocateFn reallocateFn;
+
+  // The callback Wren uses to load a module.
+  //
+  // Since Wren does not talk directly to the file system, it relies on the
+  // embedder to phyisically locate and read the source code for a module. The
+  // first time an import appears, Wren will call this and pass in the name of
+  // the module being imported. The VM should return the soure code for that
+  // module. Memory for the source should be allocated using [reallocateFn] and
+  // Wren will take ownership over it.
+  //
+  // This will only be called once for any given module name. Wren caches the
+  // result internally so subsequent imports of the same module will use the
+  // previous source and not call this.
+  //
+  // If a module with the given name could not be found by the embedder, it
+  // should return NULL and Wren will report that as a runtime error.
+  WrenLoadModuleFn loadModuleFn;
 
   // The number of bytes Wren will allocate before triggering the first garbage
   // collection.
@@ -88,31 +113,66 @@ void wrenFreeVM(WrenVM* vm);
 // Runs [source], a string of Wren source code in a new fiber in [vm].
 //
 // [sourcePath] is a string describing where [source] was located, for use in
-// debugging stack traces. It must not be `null`. If an empty string, it will
-// not be shown in a stack trace.
+// debugging stack traces. It must not be `null`.
+//
+// If it's an empty string, then [source] is considered part of the "core"
+// module. Any module-level names defined in it will be implicitly imported by
+// another other modules. This also means runtime errors in its code will be
+// omitted from stack traces (to avoid confusing users with core library
+// implementation details).
 WrenInterpretResult wrenInterpret(WrenVM* vm, const char* sourcePath,
                                   const char* source);
+
+// Creates a handle that can be used to invoke a method with [signature] on the
+// object in [module] currently stored in top-level [variable].
+//
+// This handle can be used repeatedly to directly invoke that method from C
+// code using [wrenCall].
+//
+// When done with this handle, it must be released by calling
+// [wrenReleaseMethod].
+WrenMethod* wrenGetMethod(WrenVM* vm, const char* module, const char* variable,
+                          const char* signature);
+
+// Calls [method], passing in a series of arguments whose types must match the
+// specifed [argTypes]. This is a string where each character identifies the
+// type of a single argument, in orde. The allowed types are:
+//
+// - "b" - A C `int` converted to a Wren Bool.
+// - "d" - A C `double` converted to a Wren Num.
+// - "i" - A C `int` converted to a Wren Num.
+// - "s" - A C null-terminated `const char*` converted to a Wren String. Wren
+//         will allocate its own string and copy the characters from this, so
+//         you don't have to worry about the lifetime of the string you pass to
+//         Wren.
+void wrenCall(WrenVM* vm, WrenMethod* method, const char* argTypes, ...);
+
+// Releases memory associated with [method]. After calling this, [method] can
+// no longer be used.
+void wrenReleaseMethod(WrenVM* vm, WrenMethod* method);
+
+// TODO: Figure out how these interact with modules.
 
 // Defines a foreign method implemented by the host application. Looks for a
 // global class named [className] to bind the method to. If not found, it will
 // be created automatically.
 //
-// Defines a method on that class named [methodName] accepting [arity]
-// parameters. If a method already exists with that name and arity, it will be
-// replaced. When invoked, the method will call [method].
+// Defines a method on that class with [signature]. If a method already exists
+// with that signature, it will be replaced. When invoked, the method will call
+// [method].
 void wrenDefineMethod(WrenVM* vm, const char* className,
-                      const char* methodName, int arity,
+                      const char* signature,
                       WrenForeignMethodFn method);
 
 // Defines a static foreign method implemented by the host application. Looks
 // for a global class named [className] to bind the method to. If not found, it
 // will be created automatically.
 //
-// Defines a static method on that class named [methodName] accepting
-// [arity] parameters. If a method already exists with that name and arity,
-// it will be replaced. When invoked, the method will call [method].
+// Defines a static method on that class with [signature]. If a method already
+// exists with that signature, it will be replaced. When invoked, the method
+// will call [method].
 void wrenDefineStaticMethod(WrenVM* vm, const char* className,
-                            const char* methodName, int arity,
+                            const char* signature,
                             WrenForeignMethodFn method);
 
 // The following functions read one of the arguments passed to a foreign call.

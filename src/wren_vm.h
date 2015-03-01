@@ -8,7 +8,7 @@
 
 // The maximum number of temporary objects that can be made visible to the GC
 // at one time.
-#define WREN_MAX_TEMP_ROOTS 4
+#define WREN_MAX_TEMP_ROOTS 5
 
 typedef enum
 {
@@ -50,11 +50,11 @@ typedef enum
   // Stores the top of stack in upvalue [arg]. Does not pop it.
   CODE_STORE_UPVALUE,
 
-  // Pushes the value in global slot [arg].
-  CODE_LOAD_GLOBAL,
+  // Pushes the value of the top-level variable in slot [arg].
+  CODE_LOAD_MODULE_VAR,
 
-  // Stores the top of stack in global slot [arg]. Does not pop it.
-  CODE_STORE_GLOBAL,
+  // Stores the top of stack in top-level variable slot [arg]. Does not pop it.
+  CODE_STORE_MODULE_VAR,
 
   // Pushes the value of the field in slot [arg] of the receiver of the current
   // function. This is used for regular field accesses on "this" directly in
@@ -172,10 +172,33 @@ typedef enum
   // popped.
   CODE_METHOD_STATIC,
 
+  // Load the module whose name is stored in string constant [arg]. Pushes
+  // NULL onto the stack. If the module has already been loaded, does nothing
+  // else. Otherwise, it creates a fiber to run the desired module and switches
+  // to that. When that fiber is done, the current one is resumed.
+  CODE_LOAD_MODULE,
+
+  // Reads a top-level variable from another module. [arg1] is a string
+  // constant for the name of the module, and [arg2] is a string constant for
+  // the variable name. Pushes the variable if found, or generates a runtime
+  // error otherwise.
+  CODE_IMPORT_VARIABLE,
+
   // This pseudo-instruction indicates the end of the bytecode. It should
   // always be preceded by a `CODE_RETURN`, so is never actually executed.
   CODE_END
 } Code;
+
+struct WrenMethod
+{
+  // The fiber that invokes the method. Its stack is pre-populated with the
+  // receiver for the method, and it contains a single callframe whose function
+  // is the bytecode stub to invoke the method.
+  ObjFiber* fiber;
+
+  WrenMethod* prev;
+  WrenMethod* next;
+};
 
 // TODO: Move into wren_vm.c?
 struct WrenVM
@@ -193,11 +216,13 @@ struct WrenVM
   ObjClass* rangeClass;
   ObjClass* stringClass;
 
-  // The currently defined global variables.
-  ValueBuffer globals;
-
   // The fiber that is currently running.
   ObjFiber* fiber;
+
+  // The loaded modules. Each key is an ObjString (except for the main module,
+  // whose key is null) for the module's name and the value is the ObjModule
+  // for the module.
+  ObjMap* modules;
 
   // Memory management data:
 
@@ -240,9 +265,16 @@ struct WrenVM
   // receiver) of the call on the fiber's stack.
   Value* foreignCallSlot;
 
+  // Pointer to the first node in the linked list of active method handles or
+  // NULL if there are no handles.
+  WrenMethod* methodHandles;
+
   // During a foreign function call, this will contain the number of arguments
   // to the function.
   int foreignCallNumArgs;
+
+  // The function used to load modules.
+  WrenLoadModuleFn loadModule;
 
   // Compiler and debugger data:
 
@@ -254,10 +286,6 @@ struct WrenVM
   // There is a single global symbol table for all method names on all classes.
   // Method calls are dispatched directly by index in this table.
   SymbolTable methodNames;
-
-  // Symbol table for the names of all global variables. Indexes here directly
-  // correspond to entries in [globals].
-  SymbolTable globalNames;
 };
 
 // A generic allocation function that handles all explicit memory management.
@@ -278,18 +306,38 @@ struct WrenVM
 //   [oldSize] will be zero. It should return NULL.
 void* wrenReallocate(WrenVM* vm, void* memory, size_t oldSize, size_t newSize);
 
-// Adds a new implicitly declared global named [name] to the global namespace.
+// Imports the module with [name].
 //
-// Does not check to see if a global with that name is already declared or
-// defined. Returns the symbol for the new global or -2 if there are too many
-// globals defined.
-int wrenDeclareGlobal(WrenVM* vm, const char* name, size_t length);
+// If the module has already been imported (or is already in the middle of
+// being imported, in the case of a circular import), returns true. Otherwise,
+// returns a new fiber that will execute the module's code. That fiber should
+// be called before any variables are loaded from the module.
+//
+// If the module could not be found, returns false.
+Value wrenImportModule(WrenVM* vm, const char* name);
 
-// Adds a new global named [name] to the global namespace.
+// Returns the value of the module-level variable named [name] in the main
+// module.
+Value wrenFindVariable(WrenVM* vm, const char* name);
+
+// Adds a new implicitly declared top-level variable named [name] to [module].
 //
-// Returns the symbol for the new global, -1 if a global with the given name
-// is already defined, or -2 if there are too many globals defined.
-int wrenDefineGlobal(WrenVM* vm, const char* name, size_t length, Value value);
+// If [module] is `NULL`, uses the main module.
+//
+// Does not check to see if a variable with that name is already declared or
+// defined. Returns the symbol for the new variable or -2 if there are too many
+// variables defined.
+int wrenDeclareVariable(WrenVM* vm, ObjModule* module, const char* name,
+                        size_t length);
+
+// Adds a new top-level variable named [name] to [module].
+//
+// If [module] is `NULL`, uses the main module.
+//
+// Returns the symbol for the new variable, -1 if a variable with the given name
+// is already defined, or -2 if there are too many variables defined.
+int wrenDefineVariable(WrenVM* vm, ObjModule* module, const char* name,
+                       size_t length, Value value);
 
 // Sets the current Compiler being run to [compiler].
 void wrenSetCompiler(WrenVM* vm, Compiler* compiler);

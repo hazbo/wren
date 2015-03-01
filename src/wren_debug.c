@@ -88,19 +88,19 @@ static int debugPrintInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
     case CODE_LOAD_UPVALUE: BYTE_INSTRUCTION("LOAD_UPVALUE");
     case CODE_STORE_UPVALUE: BYTE_INSTRUCTION("STORE_UPVALUE");
 
-    case CODE_LOAD_GLOBAL:
+    case CODE_LOAD_MODULE_VAR:
     {
-      int global = READ_SHORT();
-      printf("%-16s %5d '%s'\n", "LOAD_GLOBAL", global,
-             vm->globalNames.data[global].buffer);
+      int slot = READ_SHORT();
+      printf("%-16s %5d '%s'\n", "LOAD_MODULE_VAR", slot,
+             fn->module->variableNames.data[slot].buffer);
       break;
     }
 
-    case CODE_STORE_GLOBAL:
+    case CODE_STORE_MODULE_VAR:
     {
-      int global = READ_SHORT();
-      printf("%-16s %5d '%s'\n", "STORE_GLOBAL", global,
-             vm->globalNames.data[global].buffer);
+      int slot = READ_SHORT();
+      printf("%-16s %5d '%s'\n", "STORE_MODULE_VAR", slot,
+             fn->module->variableNames.data[slot].buffer);
       break;
     }
 
@@ -239,6 +239,27 @@ static int debugPrintInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
       int symbol = READ_SHORT();
       printf("%-16s %5d '%s'\n", "METHOD_STATIC", symbol,
              vm->methodNames.data[symbol].buffer);
+      break;
+    }
+
+    case CODE_LOAD_MODULE:
+    {
+      int constant = READ_SHORT();
+      printf("%-16s %5d '", "LOAD_MODULE", constant);
+      wrenPrintValue(fn->constants[constant]);
+      printf("'\n");
+      break;
+    }
+
+    case CODE_IMPORT_VARIABLE:
+    {
+      int module = READ_SHORT();
+      int variable = READ_SHORT();
+      printf("%-16s %5d '", "IMPORT_VARIABLE", module);
+      wrenPrintValue(fn->constants[module]);
+      printf("' '");
+      wrenPrintValue(fn->constants[variable]);
+      printf("'\n");
       break;
     }
 

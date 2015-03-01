@@ -20,25 +20,8 @@
 // lookup faster.
 #define MAP_LOAD_PERCENT 75
 
-// Hash codes for singleton values.
-// TODO: Tune these.
-#define HASH_FALSE 1
-#define HASH_NAN   2
-#define HASH_NULL  3
-#define HASH_TRUE  4
-
 DEFINE_BUFFER(Value, Value);
 DEFINE_BUFFER(Method, Method);
-
-#define ALLOCATE(vm, type) \
-    ((type*)wrenReallocate(vm, NULL, 0, sizeof(type)))
-
-#define ALLOCATE_FLEX(vm, mainType, arrayType, count) \
-    ((mainType*)wrenReallocate(vm, NULL, 0, \
-        sizeof(mainType) + sizeof(arrayType) * count))
-
-#define ALLOCATE_ARRAY(vm, type, count) \
-    ((type*)wrenReallocate(vm, NULL, 0, sizeof(type) * count))
 
 static void initObj(WrenVM* vm, Obj* obj, ObjType type, ObjClass* classObj)
 {
@@ -152,6 +135,13 @@ ObjFiber* wrenNewFiber(WrenVM* vm, Obj* fn)
   ObjFiber* fiber = ALLOCATE(vm, ObjFiber);
   initObj(vm, &fiber->obj, OBJ_FIBER, vm->fiberClass);
 
+  wrenResetFiber(fiber, fn);
+
+  return fiber;
+}
+
+void wrenResetFiber(ObjFiber* fiber, Obj* fn)
+{
   // Push the stack frame for the function.
   fiber->stackTop = fiber->stack;
   fiber->numFrames = 1;
@@ -171,11 +161,10 @@ ObjFiber* wrenNewFiber(WrenVM* vm, Obj* fn)
   {
     frame->ip = ((ObjClosure*)fn)->fn->bytecode;
   }
-
-  return fiber;
 }
 
-ObjFn* wrenNewFunction(WrenVM* vm, Value* constants, int numConstants,
+ObjFn* wrenNewFunction(WrenVM* vm, ObjModule* module,
+                       Value* constants, int numConstants,
                        int numUpvalues, int arity,
                        uint8_t* bytecode, int bytecodeLength,
                        ObjString* debugSourcePath,
@@ -214,6 +203,7 @@ ObjFn* wrenNewFunction(WrenVM* vm, Value* constants, int numConstants,
   // this, but it made the "for" benchmark ~15% slower for some unknown reason.
   fn->bytecode = bytecode;
   fn->constants = copiedConstants;
+  fn->module = module;
   fn->numUpvalues = numUpvalues;
   fn->numConstants = numConstants;
   fn->arity = arity;
@@ -396,26 +386,20 @@ static uint32_t hashValue(Value value)
   // TODO: We'll probably want to randomize this at some point.
 
 #if WREN_NAN_TAGGING
-  if (IS_NUM(value)) return hashNumber(AS_NUM(value));
   if (IS_OBJ(value)) return hashObject(AS_OBJ(value));
 
-  switch (GET_TAG(value))
-  {
-    case TAG_FALSE: return HASH_FALSE;
-    case TAG_NAN: return HASH_NAN;
-    case TAG_NULL: return HASH_NULL;
-    case TAG_TRUE: return HASH_TRUE;
-    default:
-      UNREACHABLE();
-      return 0;
-  }
+  // Hash the raw bits of the unboxed value.
+  DoubleBits bits;
+
+  bits.bits64 = value;
+  return bits.bits32[0] ^ bits.bits32[1];
 #else
   switch (value.type)
   {
-    case VAL_FALSE: return HASH_FALSE;
-    case VAL_NULL: return HASH_NULL;
+    case VAL_FALSE: return 0;
+    case VAL_NULL: return 1;
     case VAL_NUM: return hashNumber(AS_NUM(value));
-    case VAL_TRUE: return HASH_TRUE;
+    case VAL_TRUE: return 2;
     case VAL_OBJ: return hashObject(AS_OBJ(value));
     default:
       UNREACHABLE();
@@ -435,23 +419,27 @@ static bool addEntry(MapEntry* entries, uint32_t capacity,
   // basic linear probing.
   uint32_t index = hashValue(key) % capacity;
 
-  // We don't worry about an infinite loop here because ensureMapCapacity()
-  // ensures there are open spaces in the table.
+  // We don't worry about an infinite loop here because resizeMap() ensures
+  // there are open slots in the array.
   while (true)
   {
     MapEntry* entry = &entries[index];
 
-    // If we found an empty slot, the key is not in the table.
+    // If we found an open slot, the key is not in the table.
     if (IS_UNDEFINED(entry->key))
     {
-      entry->key = key;
-      entry->value = value;
-      return true;
+      // Don't stop at a tombstone, though, because the key may be found after
+      // it.
+      if (IS_FALSE(entry->value))
+      {
+        entry->key = key;
+        entry->value = value;
+        return true;
+      }
     }
-
-    // If the key already exists, just replace the value.
-    if (wrenValuesEqual(entry->key, key))
+    else if (wrenValuesEqual(entry->key, key))
     {
+      // If the key already exists, just replace the value.
       entry->value = value;
       return false;
     }
@@ -469,6 +457,7 @@ static void resizeMap(WrenVM* vm, ObjMap* map, uint32_t capacity)
   for (uint32_t i = 0; i < capacity; i++)
   {
     entries[i].key = UNDEFINED_VAL;
+    entries[i].value = FALSE_VAL;
   }
 
   // Re-add the existing entries.
@@ -504,11 +493,17 @@ uint32_t wrenMapFind(ObjMap* map, Value key)
   {
     MapEntry* entry = &map->entries[index];
 
-    // If we found an empty slot, the key is not in the table.
-    if (IS_UNDEFINED(entry->key)) return UINT32_MAX;
-
-    // If the key matches, we found it.
-    if (wrenValuesEqual(entry->key, key)) return index;
+    if (IS_UNDEFINED(entry->key))
+    {
+      // If we found an empty slot, the key is not in the table. If we found a
+      // slot that contains a deleted key, we have to keep looking.
+      if (IS_FALSE(entry->value)) return UINT32_MAX;
+    }
+    else if (wrenValuesEqual(entry->key, key))
+    {
+      // If the key matches, we found it.
+      return index;
+    }
 
     // Try the next slot.
     index = (index + 1) % map->capacity;
@@ -547,9 +542,12 @@ Value wrenMapRemoveKey(WrenVM* vm, ObjMap* map, Value key)
   uint32_t index = wrenMapFind(map, key);
   if (index == UINT32_MAX) return NULL_VAL;
 
-  // Remove the entry from the map.
+  // Remove the entry from the map. Set this value to true, which marks it as a
+  // deleted slot. When searching for a key, we will stop on empty slots, but
+  // continue past deleted slots.
   Value value = map->entries[index].value;
   map->entries[index].key = UNDEFINED_VAL;
+  map->entries[index].value = TRUE_VAL;
 
   if (IS_OBJ(value)) wrenPushRoot(vm, AS_OBJ(value));
 
@@ -559,9 +557,9 @@ Value wrenMapRemoveKey(WrenVM* vm, ObjMap* map, Value key)
   {
     // Removed the last item, so free the array.
     wrenMapClear(vm, map);
-    return value;
   }
-  else if (map->count < map->capacity / GROW_FACTOR * MAP_LOAD_PERCENT / 100)
+  else if (map->capacity > MIN_CAPACITY &&
+           map->count < map->capacity / GROW_FACTOR * MAP_LOAD_PERCENT / 100)
   {
     uint32_t capacity = map->capacity / GROW_FACTOR;
     if (capacity < MIN_CAPACITY) capacity = MIN_CAPACITY;
@@ -570,30 +568,25 @@ Value wrenMapRemoveKey(WrenVM* vm, ObjMap* map, Value key)
     // TODO: Should we do this less aggressively than we grow?
     resizeMap(vm, map, capacity);
   }
-  else
-  {
-    // We've removed the entry, but we need to update any subsequent entries
-    // that may have wanted to occupy its slot and got pushed down. Otherwise,
-    // we won't be able to find them later.
-    while (true)
-    {
-      index = (index + 1) % map->capacity;
-
-      // When we hit an empty entry, we know we've handled every entry that may
-      // have been affected by the removal.
-      if (IS_UNDEFINED(map->entries[index].key)) break;
-
-      // Re-add the entry so it gets dropped into the right slot.
-      Value removedKey = map->entries[index].key;
-      Value removedValue = map->entries[index].value;
-      map->entries[index].key = UNDEFINED_VAL;
-
-      addEntry(map->entries, map->capacity, removedKey, removedValue);
-    }
-  }
 
   if (IS_OBJ(value)) wrenPopRoot(vm);
   return value;
+}
+
+ObjModule* wrenNewModule(WrenVM* vm)
+{
+  ObjModule* module = ALLOCATE(vm, ObjModule);
+
+  // Modules are never used as first-class objects, so don't need a class.
+  initObj(vm, (Obj*)module, OBJ_MODULE, NULL);
+
+  wrenPushRoot(vm, (Obj*)module);
+
+  wrenSymbolTableInit(vm, &module->variableNames);
+  wrenValueBufferInit(vm, &module->variables);
+
+  wrenPopRoot(vm);
+  return module;
 }
 
 Value wrenNewRange(WrenVM* vm, double from, double to, bool isInclusive)
@@ -648,9 +641,8 @@ ObjString* wrenStringConcat(WrenVM* vm, const char* left, int leftLength,
   return string;
 }
 
-Value wrenStringCodePointAt(WrenVM* vm, ObjString* string, int index)
+Value wrenStringCodePointAt(WrenVM* vm, ObjString* string, uint32_t index)
 {
-  ASSERT(index >= 0, "Index out of bounds.");
   ASSERT(index < string->length, "Index out of bounds.");
 
   char first = string->value[index];
@@ -670,6 +662,65 @@ Value wrenStringCodePointAt(WrenVM* vm, ObjString* string, int index)
   memcpy(result->value, string->value + index, numBytes);
   result->value[numBytes] = '\0';
   return value;
+}
+
+// Uses the Boyer-Moore-Horspool string matching algorithm.
+uint32_t wrenStringFind(WrenVM* vm, ObjString* haystack, ObjString* needle)
+{
+  // Corner case, an empty needle is always found.
+  if (needle->length == 0) return 0;
+
+  // If the needle is longer than the haystack it won't be found.
+  if (needle->length > haystack->length) return UINT32_MAX;
+
+  // Pre-calculate the shift table. For each character (8-bit value), we
+  // determine how far the search window can be advanced if that character is
+  // the last character in the haystack where we are searching for the needle
+  // and the needle doesn't match there.
+  uint32_t shift[UINT8_MAX];
+  uint32_t needleEnd = needle->length - 1;
+
+  // By default, we assume the character is not the needle at all. In that case
+  // case, if a match fails on that character, we can advance one whole needle
+  // width since.
+  for (uint32_t index = 0; index < UINT8_MAX; index++)
+  {
+    shift[index] = needle->length;
+  }
+
+  // Then, for every character in the needle, determine how far it is from the
+  // end. If a match fails on that character, we can advance the window such
+  // that it the last character in it lines up with the last place we could
+  // find it in the needle.
+  for (uint32_t index = 0; index < needleEnd; index++)
+  {
+    char c = needle->value[index];
+    shift[(uint8_t)c] = needleEnd - index;
+  }
+
+  // Slide the needle across the haystack, looking for the first match or
+  // stopping if the needle goes off the end.
+  char lastChar = needle->value[needleEnd];
+  uint32_t range = haystack->length - needle->length;
+
+  for (uint32_t index = 0; index <= range; )
+  {
+    // Compare the last character in the haystack's window to the last character
+    // in the needle. If it matches, see if the whole needle matches.
+    char c = haystack->value[index + needleEnd];
+    if (lastChar == c &&
+        memcmp(haystack->value + index, needle->value, needleEnd) == 0)
+    {
+      // Found a match.
+      return index;
+    }
+
+    // Otherwise, slide the needle forward.
+    index += shift[(uint8_t)c];
+  }
+
+  // Not found.
+  return UINT32_MAX;
 }
 
 Upvalue* wrenNewUpvalue(WrenVM* vm, Value* value)
@@ -739,7 +790,10 @@ static void markFn(WrenVM* vm, ObjFn* fn)
     wrenMarkValue(vm, fn->constants[i]);
   }
 
-  wrenMarkObj(vm, (Obj*)fn->debug->sourcePath);
+  if (fn->debug->sourcePath != NULL)
+  {
+    wrenMarkObj(vm, (Obj*)fn->debug->sourcePath);
+  }
 
   // Keep track of how much memory is still in use.
   vm->bytesAllocated += sizeof(ObjFn);
@@ -790,7 +844,7 @@ static void markMap(WrenVM* vm, ObjMap* map)
   if (setMarkedFlag(&map->obj)) return;
 
   // Mark the entries.
-  for (int i = 0; i < map->capacity; i++)
+  for (uint32_t i = 0; i < map->capacity; i++)
   {
     MapEntry* entry = &map->entries[i];
     if (IS_UNDEFINED(entry->key)) continue;
@@ -802,6 +856,14 @@ static void markMap(WrenVM* vm, ObjMap* map)
   // Keep track of how much memory is still in use.
   vm->bytesAllocated += sizeof(ObjMap);
   vm->bytesAllocated += sizeof(MapEntry) * map->capacity;
+}
+
+static void markRange(WrenVM* vm, ObjRange* range)
+{
+  if (setMarkedFlag(&range->obj)) return;
+
+  // Keep track of how much memory is still in use.
+  vm->bytesAllocated += sizeof(ObjRange);
 }
 
 static void markUpvalue(WrenVM* vm, Upvalue* upvalue)
@@ -872,6 +934,21 @@ static void markClosure(WrenVM* vm, ObjClosure* closure)
   vm->bytesAllocated += sizeof(Upvalue*) * closure->fn->numUpvalues;
 }
 
+static void markModule(WrenVM* vm, ObjModule* module)
+{
+  if (setMarkedFlag(&module->obj)) return;
+
+  // Top-level variables.
+  for (int i = 0; i < module->variables.count; i++)
+  {
+    wrenMarkValue(vm, module->variables.data[i]);
+  }
+
+  // Keep track of how much memory is still in use.
+  vm->bytesAllocated += sizeof(ObjModule);
+  // TODO: Track memory for symbol table and buffer.
+}
+
 void wrenMarkObj(WrenVM* vm, Obj* obj)
 {
 #if WREN_DEBUG_TRACE_MEMORY
@@ -893,7 +970,8 @@ void wrenMarkObj(WrenVM* vm, Obj* obj)
     case OBJ_INSTANCE: markInstance(vm, (ObjInstance*)obj); break;
     case OBJ_LIST:     markList(    vm, (ObjList*)    obj); break;
     case OBJ_MAP:      markMap(     vm, (ObjMap*)     obj); break;
-    case OBJ_RANGE:    setMarkedFlag(obj); break;
+    case OBJ_MODULE:   markModule(  vm, (ObjModule*)  obj); break;
+    case OBJ_RANGE:    markRange(   vm, (ObjRange*)   obj); break;
     case OBJ_STRING:   markString(  vm, (ObjString*)  obj); break;
     case OBJ_UPVALUE:  markUpvalue( vm, (Upvalue*)    obj); break;
   }
@@ -940,6 +1018,11 @@ void wrenFreeObj(WrenVM* vm, Obj* obj)
 
     case OBJ_MAP:
       wrenReallocate(vm, ((ObjMap*)obj)->entries, 0, 0);
+      break;
+
+    case OBJ_MODULE:
+      wrenSymbolTableClear(vm, &((ObjModule*)obj)->variableNames);
+      wrenValueBufferClear(vm, &((ObjModule*)obj)->variables);
       break;
 
     case OBJ_STRING:
@@ -1010,6 +1093,7 @@ static void printObject(Obj* obj)
     case OBJ_INSTANCE: printf("[instance %p]", obj); break;
     case OBJ_LIST: printf("[list %p]", obj); break;
     case OBJ_MAP: printf("[map %p]", obj); break;
+    case OBJ_MODULE: printf("[module %p]", obj); break;
     case OBJ_RANGE: printf("[fn %p]", obj); break;
     case OBJ_STRING: printf("%s", ((ObjString*)obj)->value); break;
     case OBJ_UPVALUE: printf("[upvalue %p]", obj); break;
