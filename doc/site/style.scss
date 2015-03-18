@@ -290,10 +290,26 @@ body.core {
   }
 }
 
+table {
+  width: 100%;
+  border-collapse: collapse;
+
+  tr {
+    margin: 0;
+    padding: 0;
+    vertical-align: top;
+  }
+
+  th, td {
+    font-size: 14px;
+    line-height: 20px;
+    text-align: left;
+  }
+}
+
 // Bar charts on the performance page.
 table.chart {
-  width: 100%;
-  padding-left: 25px;
+  padding: 5px 0 5px 25px;
 
   td, th {
     line-height: 14px;
@@ -303,7 +319,6 @@ table.chart {
 
   th {
     font-size: 14px;
-    text-align: left;
     width: 100px;
   }
 
@@ -320,6 +335,24 @@ table.chart {
   .chart-bar.wren {
     background: mix($link, $link-dark, 30%);
     border-bottom: solid 1px $link-dark;
+  }
+}
+
+// Precedence table on expressions page.
+table.precedence {
+  th {
+    font: 500 11px $subheader;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: $gray-60;
+
+    padding: 6px 0;
+    border-bottom: solid 1px $gray-10;
+  }
+
+  td {
+    padding: 3px 0;
+    border-bottom: solid 1px $gray-10;
   }
 }
 

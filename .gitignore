@@ -16,8 +16,18 @@ xcuserdata/
 scratch.wren
 
 # The baseline file is machine-specific, so doesn't get checked in.
-benchmark/baseline.txt
+test/benchmark/baseline.txt
 
-# built docs get copied here, which is presumed to be a separate checkout of
-# the repo so they can be pushed to GitHub Pages.
-gh-pages/
+# Visual Studio cache files
+ipch/
+*.aps
+*.ncb
+*.opensdf
+*.sdf
+*.cachefile
+
+# Visual Studio User-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates

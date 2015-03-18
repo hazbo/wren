@@ -11,7 +11,6 @@ import sys
 
 # Runs the tests.
 WREN_DIR = dirname(dirname(realpath(__file__)))
-TEST_DIR = join(WREN_DIR, 'test')
 WREN_APP = join(WREN_DIR, 'bin', 'wrend')
 
 EXPECT_PATTERN = re.compile(r'// expect: (.*)')
@@ -82,7 +81,10 @@ def run_test(path):
       return
 
   # Make a nice short path relative to the working directory.
-  path = relpath(path)
+
+  # Normalize it to use "/" since, among other things, wren expects its argument
+  # to use that.
+  path = relpath(path).replace("\\", "/")
 
   # Read the test and parse out the expectations.
   expect_output = []
@@ -148,10 +150,14 @@ def run_test(path):
   # Invoke wren and run the test.
   proc = Popen([WREN_APP, path], stdin=PIPE, stdout=PIPE, stderr=PIPE)
   (out, err) = proc.communicate(input_bytes)
-  out = out.decode("utf-8").replace('\r\n', '\n')
-  err = err.decode("utf-8").replace('\r\n', '\n')
 
   fails = []
+
+  try:
+    out = out.decode("utf-8").replace('\r\n', '\n')
+    err = err.decode("utf-8").replace('\r\n', '\n')
+  except:
+    fails.append('Error decoding output.')
 
   # Validate that no unexpected errors occurred.
   if expect_return != 0 and err != '':
@@ -236,7 +242,9 @@ def run_test(path):
       print('      ' + color.PINK + fail + color.DEFAULT)
     print('')
 
-walk(TEST_DIR, run_test)
+
+for dir in ['core', 'io', 'language', 'limit']:
+  walk(join(WREN_DIR, 'test', dir), run_test)
 
 print_line()
 if failed == 0:

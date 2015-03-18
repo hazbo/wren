@@ -26,7 +26,8 @@ num_benchmark_todos = 0
 num_benchmark_empty = 0
 num_benchmark = 0
 
-files = itertools.chain(glob.iglob("src/*.[ch]"), glob.iglob("include/*.[ch]"))
+files = itertools.chain(glob.iglob("src/vm/*.[ch]"),
+                        glob.iglob("src/include/*.[ch]"))
 for source_path in files:
   num_files += 1
   with open(source_path, "r") as input:
@@ -68,21 +69,6 @@ for dir_path, dir_names, file_names in os.walk("test"):
           num_expects += 1
           continue
 
-for dir_path, dir_names, file_names in os.walk("benchmark"):
-  for file_name in fnmatch.filter(file_names, "*.wren"):
-    num_benchmark_files += 1
-    with open(os.path.join(dir_path, file_name), "r") as input:
-      for line in input:
-        if (line.strip() == ""):
-          num_benchmark_empty += 1
-        else:
-          num_benchmark += 1
-
-        match = TODO_PATTERN.match(line)
-        if match:
-          num_benchmark_todos += 1
-          continue
-
 print("source:")
 print("  files           " + str(num_files))
 print("  semicolons      " + str(num_semicolons))
@@ -97,9 +83,3 @@ print("  TODOs           " + str(num_test_todos))
 print("  expectations    " + str(num_expects))
 print("  non-empty lines " + str(num_test))
 print("  empty lines     " + str(num_test_empty))
-print("\n")
-print("benchmark:")
-print("  files           " + str(num_benchmark_files))
-print("  TODOs           " + str(num_benchmark_todos))
-print("  non-empty lines " + str(num_benchmark))
-print("  empty lines     " + str(num_benchmark_empty))

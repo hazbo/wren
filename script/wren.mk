@@ -19,8 +19,10 @@
 # Then, for the libraries, the correct extension is added.
 
 # Files.
-HEADERS   := include/wren.h $(wildcard src/*.h)
-SOURCES   := $(wildcard src/*.c)
+CLI_HEADERS  := $(wildcard src/cli/*.h)
+VM_HEADERS   := $(wildcard src/vm/*.h)
+CLI_SOURCES  := $(wildcard src/cli/*.c)
+VM_SOURCES   := $(wildcard src/vm/*.c)
 BUILD_DIR := build
 
 CFLAGS := -Wall -Werror -Wsign-compare -Wtype-limits -Wuninitialized
@@ -60,14 +62,24 @@ ifeq ($(ARCH),64)
 	BUILD_DIR := $(BUILD_DIR)-64
 endif
 
+# Some platform-specific workarounds. Note that we use "gcc" explicitly in the
+# call to get the machine name because one of these workarounds deals with $(CC)
+# itself not working.
+OS := $(lastword $(subst -, ,$(shell gcc -dumpmachine)))
+
 # Don't add -fPIC on Windows since it generates a warning which gets promoted
 # to an error by -Werror.
-OS := $(lastword $(subst -, ,$(shell $(CC) -dumpmachine)))
 ifeq      ($(OS),mingw32)
 else ifeq ($(OS),cygwin)
 	# Do nothing.
 else
 	CFLAGS += -fPIC
+endif
+
+# MinGW--or at least some versions of it--default CC to "cc" but then don't
+# provide an executable named "cc". Manually point to "gcc" instead.
+ifeq ($(OS),mingw32)
+	CC = GCC
 endif
 
 # Clang on Mac OS X has different flags and a different extension to build a
@@ -79,30 +91,32 @@ else
 	SHARED_EXT := so
 endif
 
-# TODO: Simplify this if we mode main.c to a different directory.
-OBJECTS := $(addprefix $(BUILD_DIR)/, $(notdir $(SOURCES:.c=.o)))
-# Don't include main.c in the libraries.
-LIB_OBJECTS := $(subst $(BUILD_DIR)/main.o,,$(OBJECTS))
+CLI_OBJECTS := $(addprefix $(BUILD_DIR)/cli/, $(notdir $(CLI_SOURCES:.c=.o)))
+VM_OBJECTS := $(addprefix $(BUILD_DIR)/vm/, $(notdir $(VM_SOURCES:.c=.o)))
 
 # Targets ---------------------------------------------------------------------
 
 all: prep bin/$(WREN) lib/lib$(WREN).a lib/lib$(WREN).$(SHARED_EXT)
 
 prep:
-	@mkdir -p bin lib $(BUILD_DIR)
+	@mkdir -p bin lib $(BUILD_DIR)/cli $(BUILD_DIR)/vm
 
 # Command-line interpreter.
-bin/$(WREN): $(OBJECTS)
-	$(CC) $(CFLAGS) -Iinclude -o $@ $^ -lm
+bin/$(WREN): $(CLI_OBJECTS) $(VM_OBJECTS)
+	$(CC) $(CFLAGS) -Isrc/include -o $@ $^ -lm
 
 # Static library.
-lib/lib$(WREN).a: $(LIB_OBJECTS)
+lib/lib$(WREN).a: $(VM_OBJECTS)
 	$(AR) rcu $@ $^
 
 # Shared library.
-lib/lib$(WREN).$(SHARED_EXT): $(LIB_OBJECTS)
+lib/lib$(WREN).$(SHARED_EXT): $(VM_OBJECTS)
 	$(CC) $(CFLAGS) -shared $(SHARED_LIB_FLAGS) -o $@ $^
 
-# Object files.
-$(BUILD_DIR)/%.o: src/%.c $(HEADERS)
-	$(CC) -c $(CFLAGS) -Iinclude -o $@ $(FILE_FLAG) $<
+# CLI object files.
+$(BUILD_DIR)/cli/%.o: src/cli/%.c $(CLI_HEADERS) $(VM_HEADERS)
+	$(CC) -c $(CFLAGS) -Isrc/include -o $@ $(FILE_FLAG) $<
+
+# VM object files.
+$(BUILD_DIR)/vm/%.o: src/vm/%.c $(VM_HEADERS)
+	$(CC) -c $(CFLAGS) -Isrc/include -o $@ $(FILE_FLAG) $<
