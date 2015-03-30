@@ -6,13 +6,15 @@ core [iterator protocol][] can extend this to get a number of helpful methods.
 
 [iterator protocol]: ../control-flow.html#the-iterator-protocol
 
+## Methods
+
 ### **all**(predicate)
 
 Tests whether all the elements in the sequence pass the `predicate`.
 
 Iterates over the sequence, passing each element to the function `predicate`.
-If its return value evaluates to `false`, stops iterating and returns `false`.
-Otherwise, returns `true`.
+If it returns something [false](../control-flow.html#truth), stops iterating
+and returns the value. Otherwise, returns `true`.
 
     :::dart
     [1, 2, 3].all {|n| n > 2} // False.
@@ -23,12 +25,34 @@ Otherwise, returns `true`.
 Tests whether any element in the sequence passes the `predicate`.
 
 Iterates over the sequence, passing each element to the function `predicate`.
-If its return value evaluates to `true`, stops iterating and returns `true`.
-Otherwise, returns `false`.
+If it returns something [true](../control-flow.html#truth), stops iterating and
+returns that value. Otherwise, returns `false`.
 
     :::dart
     [1, 2, 3].any {|n| n < 1} // False.
     [1, 2, 3].any {|n| n > 2} // True.
+
+### **contains**(element)
+
+Returns whether the sequence contains any element equal to the given element.
+
+### **count**
+
+The number of elements in the sequence.
+
+Unless a more efficient override is available, this will iterate over the
+sequence in order to determine how many elements it contains.
+
+### **count**(predicate)
+
+Returns the number of elements in the sequence that pass the `predicate`.
+
+Iterates over the sequence, passing each element to the function `predicate`
+and counting the number of times the returned value evaluates to `true`.
+
+    :::dart
+    [1, 2, 3].count {|n| n > 2} // 1.
+    [1, 2, 3].count {|n| n < 4} // 3.
 
 ### **join**(sep)
 
@@ -40,6 +64,13 @@ It is a runtime error if `sep` is not a string.
 ### **join**
 
 Calls `join` with the empty string as the separator.
+
+### **list**
+
+Creates a [list](list.html) containing all the elements in the sequence.
+
+    :::dart
+    (1..3).list  // [1, 2, 3]
 
 ### **map**(transformation)
 

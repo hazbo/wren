@@ -10,8 +10,8 @@ get involved, it's important to understand the distinction.
 
 In UTF-8, a single Unicode code point (very roughly a single "character") may
 be encoded as one or more bytes. This means you can't directly index by code
-point. There's no way to find, say, the fifth code unit in a string without
-walking the string from the beginning and counting them as you go.
+point. There's no way to jump directly to, say, the fifth code unit in a string
+without walking the string from the beginning and counting them as you go.
 
 Because counting code units is relatively slow, string methods generally index
 by *byte*, not *code unit*. When you do:
@@ -28,10 +28,64 @@ on string *return* byte indices too. So, for example, this does what you want:
     var hPosition = metalBand.indexOf("h")
     IO.print(metalBand[hPosition]) // "h"
 
-In general, methods on strings will work in terms of code units if they can do
-so efficiently, and will otherwise deal in bytes.
+In general, methods on strings work in terms of code units if they can do so
+efficiently, and otherwise deal in bytes.
+
+## Static Methods
+
+### String.**fromCodePoint**(codePoint)
+
+Creates a new string containing the UTF-8 encoding of `codePoint`.
+
+    :::dart
+    String.fromCodePoint(8225) // "‡"
+
+It is a runtime error if `codePoint` is not an integer between `0` and
+`0x10ffff`, inclusive.
 
 ## Methods
+
+### **byteAt**(index)
+
+Gets the value of the byte at byte offset `index` in the string.
+
+    :::dart
+    IO.print("hello".byteAt(1)) // 101, for "e".
+
+If the index is negative, it counts backwards from the end of the string.
+
+    :::dart
+    IO.print("hello".byteAt(-4)) // 101, for "e".
+
+It is a runtime error if `index` is not an integer or is out of bounds.
+
+### **bytes**
+
+Gets a [`Sequence`](sequence.html) that can be used to access the raw bytes of
+the string and ignore any UTF-8 encoding. In addition to the normal sequence
+methods, the returned object also has a subscript operator that can be used to
+directly index bytes.
+
+    :::dart
+    IO.print("hello".bytes[1]) // 101, for "e".
+
+### **codePointAt**(index)
+
+Gets the value of the UTF-8 encoded code point starting at byte offset `index`
+in the string. Unlike the subscript operator, this returns the code point as a
+number.
+
+    :::dart
+    var string = "(ᵔᴥᵔ)"
+    IO.print(string.codePointAt(0)) // 40, for "(".
+    IO.print(string.codePointAt(4)) // 7461, for "ᴥ".
+
+If the byte at `index` does not begin a valid UTF-8 sequence, or the end of the
+string is reached before the sequence is complete, returns `-1`.
+
+    :::dart
+    var string = "(ᵔᴥᵔ)"
+    IO.print(string.codePointAt(2)) // -1, in the middle of "ᵔ".
 
 ### **contains**(other)
 

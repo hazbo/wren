@@ -49,12 +49,12 @@ void setRootDirectory(const char* path)
   rootDirectory = path;
 }
 
-char* readModule(WrenVM* vm, const char* module)
+char* wrenFilePath(const char* name)
 {
   // The module path is relative to the root directory and with ".wren".
   size_t rootLength = rootDirectory == NULL ? 0 : strlen(rootDirectory);
-  size_t moduleLength = strlen(module);
-  size_t pathLength = rootLength + moduleLength + 5;
+  size_t nameLength = strlen(name);
+  size_t pathLength = rootLength + nameLength + 5;
   char* path = (char*)malloc(pathLength + 1);
 
   if (rootDirectory != NULL)
@@ -62,16 +62,36 @@ char* readModule(WrenVM* vm, const char* module)
     memcpy(path, rootDirectory, rootLength);
   }
 
-  memcpy(path + rootLength, module, moduleLength);
-  memcpy(path + rootLength + moduleLength, ".wren", 5);
+  memcpy(path + rootLength, name, nameLength);
+  memcpy(path + rootLength + nameLength, ".wren", 5);
   path[pathLength] = '\0';
 
-  char* file = readFile(path);
-  if (file == NULL)
-  {
-    free(path);
-    return NULL;
-  }
+  return path;
+}
 
-  return file;
+char* readModule(WrenVM* vm, const char* module)
+{
+  // First try to load the module with a ".wren" extension.
+  char* modulePath = wrenFilePath(module);
+  char* moduleContents = readFile(modulePath);
+  free(modulePath);
+
+  if (moduleContents != NULL) return moduleContents;
+
+  // If no contents could be loaded treat the module name as specifying a
+  // directory and try to load the "module.wren" file in the directory.
+  size_t moduleLength = strlen(module);
+  size_t moduleDirLength = moduleLength + 7;
+  char* moduleDir = (char*)malloc(moduleDirLength + 1);
+  memcpy(moduleDir, module, moduleLength);
+  memcpy(moduleDir + moduleLength, "/module", 7);
+  moduleDir[moduleDirLength] = '\0';
+
+  char* moduleDirPath = wrenFilePath(moduleDir);
+  free(moduleDir);
+
+  moduleContents = readFile(moduleDirPath);
+  free(moduleDirPath);
+
+  return moduleContents;
 }

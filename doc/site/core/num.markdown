@@ -1,12 +1,44 @@
 ^title Num Class
 ^category core
 
+## Static Methods
+
+### Num.**fromString**(value)
+
+Attempts to parse `value` as a decimal literal and return it as an instance of
+`Num`. If the number cannot be parsed `null` will be returned.
+
+It is a runtime error if `value` is not a string.
+
+### Num.**pi**
+
+The value of π.
+
+## Methods
+
 ### **abs**
 
 The absolute value of the number.
 
     :::dart
     -123.abs // 123
+
+### **acos**
+
+The arc cosine of the number.
+
+### **asin**
+
+The arc sine of the number.
+
+### **atan**
+
+The arc tangent of the number.
+
+### **atan**(x)
+
+The arc tangent of the number when divided by `x`, using the signs of the two
+numbers to determine the quadrant of the result.
 
 ### **ceil**
 
@@ -41,6 +73,10 @@ The sine of the number.
 ### **sqrt**
 
 The square root of the number. Returns `nan` if the number is negative.
+
+### **tan**
+
+The tangent of the number.
 
 ### **-** operator
 
@@ -110,11 +146,3 @@ from the beginning number to the ending number not including the ending number.
     IO.print(range.min)         // 1.2
     IO.print(range.max)         // 3.4
     IO.print(range.isInclusive) // false
-
-### Num.**fromString**(value)
-
-Attempts to parse `value` as a decimal literal and return it as an instance of
-`Num`. If the number cannot be parsed `null` will be returned.
-
-It is a runtime error if `value` is not a string.
-

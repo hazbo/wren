@@ -76,6 +76,7 @@ typedef enum
   TOKEN_ELSE,
   TOKEN_FALSE,
   TOKEN_FOR,
+  TOKEN_FOREIGN,
   TOKEN_IF,
   TOKEN_IMPORT,
   TOKEN_IN,
@@ -235,7 +236,7 @@ struct sCompiler
   struct sCompiler* parent;
 
   // The constants that have been defined in this function so far.
-  ObjList* constants;
+  ValueBuffer constants;
 
   // The currently in scope local variables.
   Local locals[MAX_LOCALS];
@@ -334,9 +335,11 @@ static void error(Compiler* compiler, const char* format, ...)
 // Adds [constant] to the constant pool and returns its index.
 static int addConstant(Compiler* compiler, Value constant)
 {
-  if (compiler->constants->count < MAX_CONSTANTS)
+  if (compiler->constants.count < MAX_CONSTANTS)
   {
-    wrenListAdd(compiler->parser->vm, compiler->constants, constant);
+    if (IS_OBJ(constant)) wrenPushRoot(compiler->parser->vm, AS_OBJ(constant));
+    wrenValueBufferWrite(compiler->parser->vm, &compiler->constants, constant);
+    if (IS_OBJ(constant)) wrenPopRoot(compiler->parser->vm);
   }
   else
   {
@@ -344,7 +347,7 @@ static int addConstant(Compiler* compiler, Value constant)
           MAX_CONSTANTS);
   }
 
-  return compiler->constants->count - 1;
+  return compiler->constants.count - 1;
 }
 
 // Initializes [compiler].
@@ -356,7 +359,7 @@ static void initCompiler(Compiler* compiler, Parser* parser, Compiler* parent,
 
   // Initialize this to NULL before allocating in case a GC gets triggered in
   // the middle of initializing the compiler.
-  compiler->constants = NULL;
+  wrenValueBufferInit(&compiler->constants);
 
   compiler->numUpvalues = 0;
   compiler->numParams = 0;
@@ -364,9 +367,6 @@ static void initCompiler(Compiler* compiler, Parser* parser, Compiler* parent,
   compiler->enclosingClass = NULL;
 
   wrenSetCompiler(parser->vm, compiler);
-
-  // Create a growable list for the constants used by this function.
-  compiler->constants = wrenNewList(parser->vm, 0);
 
   if (parent == NULL)
   {
@@ -401,8 +401,8 @@ static void initCompiler(Compiler* compiler, Parser* parser, Compiler* parent,
     compiler->scopeDepth = 0;
   }
 
-  wrenByteBufferInit(parser->vm, &compiler->bytecode);
-  wrenIntBufferInit(parser->vm, &compiler->debugSourceLines);
+  wrenByteBufferInit(&compiler->bytecode);
+  wrenIntBufferInit(&compiler->debugSourceLines);
 }
 
 // Lexing ----------------------------------------------------------------------
@@ -598,6 +598,7 @@ static void readName(Parser* parser, TokenType type)
   else if (isKeyword(parser, "else")) type = TOKEN_ELSE;
   else if (isKeyword(parser, "false")) type = TOKEN_FALSE;
   else if (isKeyword(parser, "for")) type = TOKEN_FOR;
+  else if (isKeyword(parser, "foreign")) type = TOKEN_FOREIGN;
   else if (isKeyword(parser, "if")) type = TOKEN_IF;
   else if (isKeyword(parser, "import")) type = TOKEN_IMPORT;
   else if (isKeyword(parser, "in")) type = TOKEN_IN;
@@ -621,15 +622,15 @@ static void addStringChar(Parser* parser, char c)
   wrenByteBufferWrite(parser->vm, &parser->string, c);
 }
 
-// Reads a four hex digit Unicode escape sequence in a string literal.
-static void readUnicodeEscape(Parser* parser)
+// Reads [digits] hex digits in a string literal and returns their number value.
+static int readHexEscape(Parser* parser, int digits, const char* description)
 {
   int value = 0;
-  for (int i = 0; i < 4; i++)
+  for (int i = 0; i < digits; i++)
   {
     if (peekChar(parser) == '"' || peekChar(parser) == '\0')
     {
-      lexError(parser, "Incomplete Unicode escape sequence.");
+      lexError(parser, "Incomplete %s escape sequence.", description);
 
       // Don't consume it if it isn't expected. Keeps us from reading past the
       // end of an unterminated string.
@@ -640,46 +641,33 @@ static void readUnicodeEscape(Parser* parser)
     int digit = readHexDigit(parser);
     if (digit == -1)
     {
-      lexError(parser, "Invalid Unicode escape sequence.");
+      lexError(parser, "Invalid %s escape sequence.", description);
       break;
     }
 
     value = (value * 16) | digit;
   }
 
-  ByteBuffer* buffer = &parser->string;
+  return value;
+}
 
-  // UTF-8 encode the value.
-  if (value <= 0x7f)
+// Reads a four hex digit Unicode escape sequence in a string literal.
+static void readUnicodeEscape(Parser* parser)
+{
+  int value = readHexEscape(parser, 4, "Unicode");
+
+  // Grow the buffer enough for the encoded result.
+  int numBytes = wrenUtf8NumBytes(value);
+  if (numBytes != 0)
   {
-    // Single byte (i.e. fits in ASCII).
-    wrenByteBufferWrite(parser->vm, buffer, value);
-  }
-  else if (value <= 0x7ff)
-  {
-    // Two byte sequence: 110xxxxx	 10xxxxxx.
-    wrenByteBufferWrite(parser->vm, buffer, 0xc0 | ((value & 0x7c0) >> 6));
-    wrenByteBufferWrite(parser->vm, buffer, 0x80 | (value & 0x3f));
-  }
-  else if (value <= 0xffff)
-  {
-    // Three byte sequence: 1110xxxx	 10xxxxxx 10xxxxxx.
-    wrenByteBufferWrite(parser->vm, buffer, 0xe0 | ((value & 0xf000) >> 12));
-    wrenByteBufferWrite(parser->vm, buffer, 0x80 | ((value & 0xfc0) >> 6));
-    wrenByteBufferWrite(parser->vm, buffer, 0x80 | (value & 0x3f));
-  }
-  else if (value <= 0x10ffff)
-  {
-    // Four byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx.
-    wrenByteBufferWrite(parser->vm, buffer, 0xf0 | ((value & 0x1c0000) >> 18));
-    wrenByteBufferWrite(parser->vm, buffer, 0x80 | ((value & 0x3f000) >> 12));
-    wrenByteBufferWrite(parser->vm, buffer, 0x80 | ((value & 0xfc0) >> 6));
-    wrenByteBufferWrite(parser->vm, buffer, 0x80 | (value & 0x3f));
-  }
-  else
-  {
-    // Invalid Unicode value. See: http://tools.ietf.org/html/rfc3629
-    // TODO: Error.
+    // TODO: Function to grow buffer in one allocation.
+    for (int i = 0; i < numBytes; i++)
+    {
+      wrenByteBufferWrite(parser->vm, &parser->string, 0);
+    }
+
+    wrenUtf8Encode(value,
+                   parser->string.data + parser->string.count - numBytes);
   }
 }
 
@@ -716,9 +704,13 @@ static void readString(Parser* parser)
         case 'n':  addStringChar(parser, '\n'); break;
         case 'r':  addStringChar(parser, '\r'); break;
         case 't':  addStringChar(parser, '\t'); break;
-        case 'v':  addStringChar(parser, '\v'); break;
         case 'u':  readUnicodeEscape(parser); break;
           // TODO: 'U' for 8 octet Unicode escapes.
+        case 'v':  addStringChar(parser, '\v'); break;
+        case 'x':
+          addStringChar(parser, (uint8_t)readHexEscape(parser, 2, "byte"));
+          break;
+
         default:
           lexError(parser, "Invalid escape character '%c'.",
                    *(parser->currentChar - 1));
@@ -972,9 +964,9 @@ static void consumeLine(Compiler* compiler, const char* errorMessage)
 // Variables and scopes --------------------------------------------------------
 
 // Emits one bytecode instruction or single-byte argument. Returns its index.
-static int emit(Compiler* compiler, uint8_t byte)
+static int emit(Compiler* compiler, int byte)
 {
-  wrenByteBufferWrite(compiler->parser->vm, &compiler->bytecode, byte);
+  wrenByteBufferWrite(compiler->parser->vm, &compiler->bytecode, (uint8_t)byte);
 
   // Assume the instruction is associated with the most recently consumed token.
   wrenIntBufferWrite(compiler->parser->vm, &compiler->debugSourceLines,
@@ -984,7 +976,7 @@ static int emit(Compiler* compiler, uint8_t byte)
 }
 
 // Emits one 16-bit argument, which will be written big endian.
-static void emitShort(Compiler* compiler, uint16_t arg)
+static void emitShort(Compiler* compiler, int arg)
 {
   emit(compiler, (arg >> 8) & 0xff);
   emit(compiler, arg & 0xff);
@@ -992,7 +984,7 @@ static void emitShort(Compiler* compiler, uint16_t arg)
 
 // Emits one bytecode instruction followed by a 8-bit argument. Returns the
 // index of the argument in the bytecode.
-static int emitByteArg(Compiler* compiler, Code instruction, uint8_t arg)
+static int emitByteArg(Compiler* compiler, Code instruction, int arg)
 {
   emit(compiler, instruction);
   return emit(compiler, arg);
@@ -1000,7 +992,7 @@ static int emitByteArg(Compiler* compiler, Code instruction, uint8_t arg)
 
 // Emits one bytecode instruction followed by a 16-bit argument, which will be
 // written big endian.
-static void emitShortArg(Compiler* compiler, Code instruction, uint16_t arg)
+static void emitShortArg(Compiler* compiler, Code instruction, int arg)
 {
   emit(compiler, instruction);
   emitShort(compiler, arg);
@@ -1282,6 +1274,13 @@ static void loadLocal(Compiler* compiler, int slot)
   emitByteArg(compiler, CODE_LOAD_LOCAL, slot);
 }
 
+// Discards memory owned by [compiler].
+static void freeCompiler(Compiler* compiler)
+{
+  wrenByteBufferClear(compiler->parser->vm, &compiler->bytecode);
+  wrenIntBufferClear(compiler->parser->vm, &compiler->debugSourceLines);
+}
+
 // Finishes [compiler], which is compiling a function, method, or chunk of top
 // level code. If there is a parent compiler, then this emits code in the
 // parent compiler to load the resulting function.
@@ -1293,8 +1292,7 @@ static ObjFn* endCompiler(Compiler* compiler,
   if (compiler->parser->hasError)
   {
     // Free the code since it won't be used.
-    wrenByteBufferClear(compiler->parser->vm, &compiler->bytecode);
-    wrenIntBufferClear(compiler->parser->vm, &compiler->debugSourceLines);
+    freeCompiler(compiler);
     return NULL;
   }
 
@@ -1305,8 +1303,8 @@ static ObjFn* endCompiler(Compiler* compiler,
   // Create a function object for the code we just compiled.
   ObjFn* fn = wrenNewFunction(compiler->parser->vm,
                               compiler->parser->module,
-                              compiler->constants->elements,
-                              compiler->constants->count,
+                              compiler->constants.data,
+                              compiler->constants.count,
                               compiler->numUpvalues,
                               compiler->numParams,
                               compiler->bytecode.data,
@@ -1349,7 +1347,7 @@ static ObjFn* endCompiler(Compiler* compiler,
   wrenPopRoot(compiler->parser->vm);
 
   #if WREN_DEBUG_DUMP_COMPILED_CODE
-    wrenDebugPrintCode(compiler->parser->vm, fn);
+    wrenDumpCode(compiler->parser->vm, fn);
   #endif
 
   return fn;
@@ -1442,14 +1440,14 @@ static void patchJump(Compiler* compiler, int offset)
 
 // Parses a block body, after the initial "{" has been consumed.
 //
-// Returns true if it was a statement body, false if it was an expression body.
-// (More precisely, returns false if a value was left on the stack. An empty
-// block returns true.)
+// Returns true if it was a expression body, false if it was an statement body.
+// (More precisely, returns true if a value was left on the stack. An empty
+// block returns false.)
 static bool finishBlock(Compiler* compiler)
 {
   // Empty blocks do nothing.
   if (match(compiler, TOKEN_RIGHT_BRACE)) {
-    return true;
+    return false;
   }
 
   // If there's no line after the "{", it's a single-expression body.
@@ -1457,12 +1455,12 @@ static bool finishBlock(Compiler* compiler)
   {
     expression(compiler);
     consume(compiler, TOKEN_RIGHT_BRACE, "Expect '}' at end of block.");
-    return false;
+    return true;
   }
 
   // Empty blocks (with just a newline inside) do nothing.
   if (match(compiler, TOKEN_RIGHT_BRACE)) {
-    return true;
+    return false;
   }
 
   // Compile the definition list.
@@ -1476,23 +1474,23 @@ static bool finishBlock(Compiler* compiler)
     consumeLine(compiler, "Expect newline after statement.");
   }
   while (!match(compiler, TOKEN_RIGHT_BRACE));
-  return true;
+  return false;
 }
 
 // Parses a method or function body, after the initial "{" has been consumed.
 static void finishBody(Compiler* compiler, bool isConstructor)
 {
-  bool isStatementBody = finishBlock(compiler);
+  bool isExpressionBody = finishBlock(compiler);
 
   if (isConstructor)
   {
     // If the constructor body evaluates to a value, discard it.
-    if (!isStatementBody) emit(compiler, CODE_POP);
+    if (isExpressionBody) emit(compiler, CODE_POP);
 
     // The receiver is always stored in the first local slot.
     emit(compiler, CODE_LOAD_LOCAL_0);
   }
-  else if (isStatementBody)
+  else if (!isExpressionBody)
   {
     // Implicitly return null in statement bodies.
     emit(compiler, CODE_NULL);
@@ -2450,6 +2448,7 @@ GrammarRule rules[] =
   /* TOKEN_ELSE          */ UNUSED,
   /* TOKEN_FALSE         */ PREFIX(boolean),
   /* TOKEN_FOR           */ UNUSED,
+  /* TOKEN_FOREIGN       */ UNUSED,
   /* TOKEN_IF            */ UNUSED,
   /* TOKEN_IMPORT        */ UNUSED,
   /* TOKEN_IN            */ UNUSED,
@@ -2518,7 +2517,7 @@ void block(Compiler* compiler)
   if (match(compiler, TOKEN_LEFT_BRACE))
   {
     pushScope(compiler);
-    if (!finishBlock(compiler))
+    if (finishBlock(compiler))
     {
       // Block was an expression, so discard it.
       emit(compiler, CODE_POP);
@@ -2686,7 +2685,7 @@ static void endLoop(Compiler* compiler)
     {
       // Skip this instruction and its arguments.
       i += 1 + getNumArguments(compiler->bytecode.data,
-                               compiler->constants->elements, i);
+                               compiler->constants.data, i);
     }
   }
 
@@ -2893,8 +2892,8 @@ void statement(Compiler* compiler)
 
 // Compiles a method definition inside a class body. Returns the symbol in the
 // method table for the new method.
-int method(Compiler* compiler, ClassCompiler* classCompiler, bool isConstructor,
-           SignatureFn signatureFn)
+static int method(Compiler* compiler, ClassCompiler* classCompiler,
+                  bool isConstructor, bool isForeign, SignatureFn signatureFn)
 {
   // Build the method signature.
   Signature signature;
@@ -2909,16 +2908,30 @@ int method(Compiler* compiler, ClassCompiler* classCompiler, bool isConstructor,
   // Compile the method signature.
   signatureFn(&methodCompiler, &signature);
 
-  consume(compiler, TOKEN_LEFT_BRACE, "Expect '{' to begin method body.");
-
-  finishBody(&methodCompiler, isConstructor);
-
   // Include the full signature in debug messages in stack traces.
-  char debugName[MAX_METHOD_SIGNATURE];
+  char fullSignature[MAX_METHOD_SIGNATURE];
   int length;
-  signatureToString(&signature, debugName, &length);
+  signatureToString(&signature, fullSignature, &length);
 
-  endCompiler(&methodCompiler, debugName, length);
+  if (isForeign)
+  {
+    // Define a constant for the signature.
+    int constant = addConstant(compiler, wrenNewString(compiler->parser->vm,
+                                                       fullSignature, length));
+    emitShortArg(compiler, CODE_CONSTANT, constant);
+
+    // We don't need the function we started compiling in the parameter list
+    // any more.
+    freeCompiler(&methodCompiler);
+  }
+  else
+  {
+    consume(compiler, TOKEN_LEFT_BRACE, "Expect '{' to begin method body.");
+    finishBody(&methodCompiler, isConstructor);
+
+    endCompiler(&methodCompiler, fullSignature, length);
+  }
+
   return signatureSymbol(compiler, &signature);
 }
 
@@ -2967,7 +2980,7 @@ static void classDefinition(Compiler* compiler)
   // bytecode will be adjusted by [wrenBindMethod] to take inherited fields
   // into account.
   SymbolTable fields;
-  wrenSymbolTableInit(compiler->parser->vm, &fields);
+  wrenSymbolTableInit(&fields);
 
   classCompiler.fields = &fields;
 
@@ -2981,6 +2994,8 @@ static void classDefinition(Compiler* compiler)
   {
     Code instruction = CODE_METHOD_INSTANCE;
     bool isConstructor = false;
+    // TODO: What about foreign constructors?
+    bool isForeign = match(compiler, TOKEN_FOREIGN);
 
     classCompiler.isStaticMethod = false;
 
@@ -3005,7 +3020,7 @@ static void classDefinition(Compiler* compiler)
     }
 
     int methodSymbol = method(compiler, &classCompiler, isConstructor,
-                              signature);
+                              isForeign, signature);
 
     // Load the class. We have to do this for each method because we can't
     // keep the class on top of the stack. If there are static fields, they
@@ -3031,7 +3046,7 @@ static void classDefinition(Compiler* compiler)
   }
 
   // Update the class with the number of fields.
-  compiler->bytecode.data[numFieldsInstruction] = fields.count;
+  compiler->bytecode.data[numFieldsInstruction] = (uint8_t)fields.count;
   wrenSymbolTableClear(compiler->parser->vm, &fields);
 
   compiler->enclosingClass = NULL;
@@ -3145,7 +3160,7 @@ ObjFn* wrenCompile(WrenVM* vm, ObjModule* module,
   parser.skipNewlines = true;
   parser.hasError = false;
 
-  wrenByteBufferInit(vm, &parser.string);
+  wrenByteBufferInit(&parser.string);
 
   // Read the first token.
   nextToken(&parser);
@@ -3234,13 +3249,10 @@ void wrenMarkCompiler(WrenVM* vm, Compiler* compiler)
 
   // Walk up the parent chain to mark the outer compilers too. The VM only
   // tracks the innermost one.
-  while (compiler != NULL)
+  do
   {
-    if (compiler->constants != NULL)
-    {
-      wrenMarkObj(vm, (Obj*)compiler->constants);
-    }
-
+    wrenMarkBuffer(vm, &compiler->constants);
     compiler = compiler->parent;
   }
+  while (compiler != NULL);
 }

@@ -45,10 +45,43 @@
 // This string literal is generated automatically from core. Do not edit.
 static const char* libSource =
 "class Sequence {\n"
+"  all(f) {\n"
+"    var result = true\n"
+"    for (element in this) {\n"
+"      result = f.call(element)\n"
+"      if (!result) return result\n"
+"    }\n"
+"    return result\n"
+"  }\n"
+"\n"
+"  any(f) {\n"
+"    var result = false\n"
+"    for (element in this) {\n"
+"      result = f.call(element)\n"
+"      if (result) return result\n"
+"    }\n"
+"    return result\n"
+"  }\n"
+"\n"
+"  contains(element) {\n"
+"    for (item in this) {\n"
+"      if (element == item) return true\n"
+"    }\n"
+"    return false\n"
+"  }\n"
+"\n"
 "  count {\n"
 "    var result = 0\n"
 "    for (element in this) {\n"
 "      result = result + 1\n"
+"    }\n"
+"    return result\n"
+"  }\n"
+"\n"
+"  count(f) {\n"
+"    var result = 0\n"
+"    for (element in this) {\n"
+"      if (f.call(element)) result = result + 1\n"
 "    }\n"
 "    return result\n"
 "  }\n"
@@ -67,20 +100,6 @@ static const char* libSource =
 "      if (f.call(element)) result.add(element)\n"
 "    }\n"
 "    return result\n"
-"  }\n"
-"\n"
-"  all(f) {\n"
-"    for (element in this) {\n"
-"      if (!f.call(element)) return false\n"
-"    }\n"
-"    return true\n"
-"  }\n"
-"\n"
-"  any(f) {\n"
-"    for (element in this) {\n"
-"      if (f.call(element)) return true\n"
-"    }\n"
-"    return false\n"
 "  }\n"
 "\n"
 "  reduce(acc, f) {\n"
@@ -117,9 +136,29 @@ static const char* libSource =
 "\n"
 "    return result\n"
 "  }\n"
+"\n"
+"  list {\n"
+"    var result = new List\n"
+"    for (element in this) {\n"
+"      result.add(element)\n"
+"    }\n"
+"    return result\n"
+"  }\n"
 "}\n"
 "\n"
-"class String is Sequence {}\n"
+"class String is Sequence {\n"
+"  bytes { new StringByteSequence(this) }\n"
+"}\n"
+"\n"
+"class StringByteSequence is Sequence {\n"
+"  new(string) {\n"
+"    _string = string\n"
+"  }\n"
+"\n"
+"  [index] { _string.byteAt(index) }\n"
+"  iterate(iterator) { _string.iterateByte_(iterator) }\n"
+"  iteratorValue(iterator) { _string.byteAt(iterator) }\n"
+"}\n"
 "\n"
 "class List is Sequence {\n"
 "  addAll(other) {\n"
@@ -137,15 +176,6 @@ static const char* libSource =
 "      result.add(element)\n"
 "    }\n"
 "    return result\n"
-"  }\n"
-"\n"
-"  contains(element) {\n"
-"    for (item in this) {\n"
-"      if (element == item) {\n"
-"        return true\n"
-"      }\n"
-"    }\n"
-"    return false\n"
 "  }\n"
 "}\n"
 "\n"
@@ -230,22 +260,20 @@ static bool validateInt(WrenVM* vm, Value* args, int index, const char* argName)
 
 // Validates that [value] is an integer within `[0, count)`. Also allows
 // negative indices which map backwards from the end. Returns the valid positive
-// index value. If invalid, reports an error and returns -1.
-static int validateIndexValue(WrenVM* vm, Value* args, int count, double value,
-                              const char* argName)
+// index value. If invalid, reports an error and returns `UINT32_MAX`.
+static uint32_t validateIndexValue(WrenVM* vm, Value* args, uint32_t count,
+                                    double value, const char* argName)
 {
-  if (!validateIntValue(vm, args, value, argName)) return -1;
-
-  int index = (int)value;
+  if (!validateIntValue(vm, args, value, argName)) return UINT32_MAX;
 
   // Negative indices count from the end.
-  if (index < 0) index = count + index;
+  if (value < 0) value = count + value;
 
   // Check bounds.
-  if (index >= 0 && index < count) return index;
+  if (value >= 0 && value < count) return (uint32_t)value;
 
   args[0] = wrenStringFormat(vm, "$ out of bounds.", argName);
-  return -1;
+  return UINT32_MAX;
 }
 
 // Validates that [key] is a valid object for use as a map key. Returns true if
@@ -265,13 +293,14 @@ static bool validateKey(WrenVM* vm, Value* args, int index)
 
 // Validates that the argument at [argIndex] is an integer within `[0, count)`.
 // Also allows negative indices which map backwards from the end. Returns the
-// valid positive index value. If invalid, reports an error and returns -1.
-static int validateIndex(WrenVM* vm, Value* args, int count, int argIndex,
-                         const char* argName)
+// valid positive index value. If invalid, reports an error and returns
+// `UINT32_MAX`.
+static uint32_t validateIndex(WrenVM* vm, Value* args, uint32_t count,
+                              int arg, const char* argName)
 {
-  if (!validateNum(vm, args, argIndex, argName)) return -1;
+  if (!validateNum(vm, args, arg, argName)) return UINT32_MAX;
 
-  return validateIndexValue(vm, args, count, AS_NUM(args[argIndex]), argName);
+  return validateIndexValue(vm, args, count, AS_NUM(args[arg]), argName);
 }
 
 // Validates that the given argument in [args] is a String. Returns true if it
@@ -289,54 +318,59 @@ static bool validateString(WrenVM* vm, Value* args, int index,
 // the series of elements that should be chosen from the underlying object.
 // Handles ranges that count backwards from the end as well as negative ranges.
 //
-// Returns the index from which the range should start or -1 if the range is
-// invalid. After calling, [length] will be updated with the number of elements
-// in the resulting sequence. [step] will be direction that the range is going:
-// `1` if the range is increasing from the start index or `-1` if the range is
-// decreasing.
-static int calculateRange(WrenVM* vm, Value* args, ObjRange* range,
-                                      int* length, int* step)
+// Returns the index from which the range should start or `UINT32_MAX` if the
+// range is invalid. After calling, [length] will be updated with the number of
+// elements in the resulting sequence. [step] will be direction that the range
+// is going: `1` if the range is increasing from the start index or `-1` if the
+// range is decreasing.
+static uint32_t calculateRange(WrenVM* vm, Value* args, ObjRange* range,
+                               uint32_t* length, int* step)
 {
+  *step = 0;
+
   // Corner case: an empty range at zero is allowed on an empty sequence.
   // This way, list[0..-1] and list[0...list.count] can be used to copy a list
   // even when empty.
   if (*length == 0 && range->from == 0 &&
       range->to == (range->isInclusive ? -1 : 0)) {
-    *step = 0;
     return 0;
   }
 
-  int from = validateIndexValue(vm, args, *length, range->from,
-                                "Range start");
-  if (from == -1) return -1;
+  uint32_t from = validateIndexValue(vm, args, *length, range->from,
+                                     "Range start");
+  if (from == UINT32_MAX) return UINT32_MAX;
 
-  int to;
+  // Bounds check the end manually to handle exclusive ranges.
+  double value = range->to;
+  if (!validateIntValue(vm, args, value, "Range end")) return UINT32_MAX;
 
-  if (range->isInclusive)
+  // Negative indices count from the end.
+  if (value < 0) value = *length + value;
+
+  // Convert the exclusive range to an inclusive one.
+  if (!range->isInclusive)
   {
-    to = validateIndexValue(vm, args, *length, range->to, "Range end");
-    if (to == -1) return -1;
-
-    *length = abs(from - to) + 1;
-  }
-  else
-  {
-    if (!validateIntValue(vm, args, range->to, "Range end")) return -1;
-
-    // Bounds check it manually here since the excusive range can hang over
-    // the edge.
-    to = (int)range->to;
-    if (to < 0) to = *length + to;
-
-    if (to < -1 || to > *length)
+    // An exclusive range with the same start and end points is empty.
+    if (value == from)
     {
-      args[0] = CONST_STRING(vm, "Range end out of bounds.");
-      return -1;
+      *length = 0;
+      return from;
     }
 
-    *length = abs(from - to);
+    // Shift the endpoint to make it inclusive, handling both increasing and
+    // decreasing ranges.
+    value += value >= from ? -1 : 1;
   }
 
+  // Check bounds.
+  if (value < 0 || value >= *length)
+  {
+    args[0] = CONST_STRING(vm, "Range end out of bounds.");
+    return UINT32_MAX;
+  }
+
+  uint32_t to = (uint32_t)value;
+  *length = abs(from - to) + 1;
   *step = from < to ? 1 : -1;
   return from;
 }
@@ -360,14 +394,12 @@ DEF_PRIMITIVE(bool_toString)
 
 DEF_PRIMITIVE(class_instantiate)
 {
-  ObjClass* classObj = AS_CLASS(args[0]);
-  RETURN_VAL(wrenNewInstance(vm, classObj));
+  RETURN_VAL(wrenNewInstance(vm, AS_CLASS(args[0])));
 }
 
 DEF_PRIMITIVE(class_name)
 {
-  ObjClass* classObj = AS_CLASS(args[0]);
-  RETURN_OBJ(classObj->name);
+  RETURN_OBJ(AS_CLASS(args[0])->name);
 }
 
 DEF_PRIMITIVE(class_supertype)
@@ -599,8 +631,8 @@ DEF_PRIMITIVE(fiber_yield1)
 
 DEF_PRIMITIVE(fn_instantiate)
 {
-  // Return the Fn class itself. When we then call "new" on it, it will
-  // return the block.
+  // Return the Fn class itself. When we then call "new" on it, it will return
+  // the block.
   RETURN_VAL(args[0]);
 }
 
@@ -664,25 +696,19 @@ DEF_PRIMITIVE(list_instantiate)
 
 DEF_PRIMITIVE(list_add)
 {
-  ObjList* list = AS_LIST(args[0]);
-  wrenListAdd(vm, list, args[1]);
+  wrenValueBufferWrite(vm, &AS_LIST(args[0])->elements, args[1]);
   RETURN_VAL(args[1]);
 }
 
 DEF_PRIMITIVE(list_clear)
 {
-  ObjList* list = AS_LIST(args[0]);
-  DEALLOCATE(vm, list->elements);
-  list->elements = NULL;
-  list->capacity = 0;
-  list->count = 0;
+  wrenValueBufferClear(vm, &AS_LIST(args[0])->elements);
   RETURN_NULL;
 }
 
 DEF_PRIMITIVE(list_count)
 {
-  ObjList* list = AS_LIST(args[0]);
-  RETURN_NUM(list->count);
+  RETURN_NUM(AS_LIST(args[0])->elements.count);
 }
 
 DEF_PRIMITIVE(list_insert)
@@ -690,8 +716,9 @@ DEF_PRIMITIVE(list_insert)
   ObjList* list = AS_LIST(args[0]);
 
   // count + 1 here so you can "insert" at the very end.
-  int index = validateIndex(vm, args, list->count + 1, 1, "Index");
-  if (index == -1) return PRIM_ERROR;
+  uint32_t index = validateIndex(vm, args, list->elements.count + 1, 1,
+                                 "Index");
+  if (index == UINT32_MAX) return PRIM_ERROR;
 
   wrenListInsert(vm, list, args[2], index);
   RETURN_VAL(args[2]);
@@ -704,16 +731,15 @@ DEF_PRIMITIVE(list_iterate)
   // If we're starting the iteration, return the first index.
   if (IS_NULL(args[1]))
   {
-    if (list->count == 0) RETURN_FALSE;
+    if (list->elements.count == 0) RETURN_FALSE;
     RETURN_NUM(0);
   }
 
   if (!validateInt(vm, args, 1, "Iterator")) return PRIM_ERROR;
 
-  int index = (int)AS_NUM(args[1]);
-
   // Stop if we're out of bounds.
-  if (index < 0 || index >= list->count - 1) RETURN_FALSE;
+  double index = AS_NUM(args[1]);
+  if (index < 0 || index >= list->elements.count - 1) RETURN_FALSE;
 
   // Otherwise, move to the next index.
   RETURN_NUM(index + 1);
@@ -722,17 +748,17 @@ DEF_PRIMITIVE(list_iterate)
 DEF_PRIMITIVE(list_iteratorValue)
 {
   ObjList* list = AS_LIST(args[0]);
-  int index = validateIndex(vm, args, list->count, 1, "Iterator");
-  if (index == -1) return PRIM_ERROR;
+  uint32_t index = validateIndex(vm, args, list->elements.count, 1, "Iterator");
+  if (index == UINT32_MAX) return PRIM_ERROR;
 
-  RETURN_VAL(list->elements[index]);
+  RETURN_VAL(list->elements.data[index]);
 }
 
 DEF_PRIMITIVE(list_removeAt)
 {
   ObjList* list = AS_LIST(args[0]);
-  int index = validateIndex(vm, args, list->count, 1, "Index");
-  if (index == -1) return PRIM_ERROR;
+  uint32_t index = validateIndex(vm, args, list->elements.count, 1, "Index");
+  if (index == UINT32_MAX) return PRIM_ERROR;
 
   RETURN_VAL(wrenListRemoveAt(vm, list, index));
 }
@@ -743,10 +769,11 @@ DEF_PRIMITIVE(list_subscript)
 
   if (IS_NUM(args[1]))
   {
-    int index = validateIndex(vm, args, list->count, 1, "Subscript");
-    if (index == -1) return PRIM_ERROR;
+    uint32_t index = validateIndex(vm, args, list->elements.count, 1,
+                                   "Subscript");
+    if (index == UINT32_MAX) return PRIM_ERROR;
 
-    RETURN_VAL(list->elements[index]);
+    RETURN_VAL(list->elements.data[index]);
   }
 
   if (!IS_RANGE(args[1]))
@@ -755,14 +782,14 @@ DEF_PRIMITIVE(list_subscript)
   }
 
   int step;
-  int count = list->count;
-  int start = calculateRange(vm, args, AS_RANGE(args[1]), &count, &step);
-  if (start == -1) return PRIM_ERROR;
+  uint32_t count = list->elements.count;
+  uint32_t start = calculateRange(vm, args, AS_RANGE(args[1]), &count, &step);
+  if (start == UINT32_MAX) return PRIM_ERROR;
 
   ObjList* result = wrenNewList(vm, count);
-  for (int i = 0; i < count; i++)
+  for (uint32_t i = 0; i < count; i++)
   {
-    result->elements[i] = list->elements[start + (i * step)];
+    result->elements.data[i] = list->elements.data[start + (i * step)];
   }
 
   RETURN_OBJ(result);
@@ -771,10 +798,11 @@ DEF_PRIMITIVE(list_subscript)
 DEF_PRIMITIVE(list_subscriptSetter)
 {
   ObjList* list = AS_LIST(args[0]);
-  int index = validateIndex(vm, args, list->count, 1, "Subscript");
-  if (index == -1) return PRIM_ERROR;
+  uint32_t index = validateIndex(vm, args, list->elements.count, 1,
+                                 "Subscript");
+  if (index == UINT32_MAX) return PRIM_ERROR;
 
-  list->elements[index] = args[2];
+  list->elements.data[index] = args[2];
   RETURN_VAL(args[2]);
 }
 
@@ -863,8 +891,8 @@ DEF_PRIMITIVE(map_remove)
 DEF_PRIMITIVE(map_keyIteratorValue)
 {
   ObjMap* map = AS_MAP(args[0]);
-  int index = validateIndex(vm, args, map->capacity, 1, "Iterator");
-  if (index == -1) return PRIM_ERROR;
+  uint32_t index = validateIndex(vm, args, map->capacity, 1, "Iterator");
+  if (index == UINT32_MAX) return PRIM_ERROR;
 
   MapEntry* entry = &map->entries[index];
   if (IS_UNDEFINED(entry->key))
@@ -878,8 +906,8 @@ DEF_PRIMITIVE(map_keyIteratorValue)
 DEF_PRIMITIVE(map_valueIteratorValue)
 {
   ObjMap* map = AS_MAP(args[0]);
-  int index = validateIndex(vm, args, map->capacity, 1, "Iterator");
-  if (index == -1) return PRIM_ERROR;
+  uint32_t index = validateIndex(vm, args, map->capacity, 1, "Iterator");
+  if (index == UINT32_MAX) return PRIM_ERROR;
 
   MapEntry* entry = &map->entries[index];
   if (IS_UNDEFINED(entry->key))
@@ -898,76 +926,6 @@ DEF_PRIMITIVE(null_not)
 DEF_PRIMITIVE(null_toString)
 {
   RETURN_VAL(CONST_STRING(vm, "null"));
-}
-
-DEF_PRIMITIVE(num_abs)
-{
-  RETURN_NUM(fabs(AS_NUM(args[0])));
-}
-
-DEF_PRIMITIVE(num_ceil)
-{
-  RETURN_NUM(ceil(AS_NUM(args[0])));
-}
-
-DEF_PRIMITIVE(num_cos)
-{
-  RETURN_NUM(cos(AS_NUM(args[0])));
-}
-
-DEF_PRIMITIVE(num_floor)
-{
-  RETURN_NUM(floor(AS_NUM(args[0])));
-}
-
-DEF_PRIMITIVE(num_fraction)
-{
-  double dummy;
-  RETURN_NUM(modf(AS_NUM(args[0]) , &dummy));
-}
-
-DEF_PRIMITIVE(num_isNan)
-{
-  RETURN_BOOL(isnan(AS_NUM(args[0])));
-}
-
-DEF_PRIMITIVE(num_sign)
-{
-  double value = AS_NUM(args[0]);
-  if (value > 0)
-  {
-    RETURN_NUM(1);
-  }
-  else if (value < 0)
-  {
-    RETURN_NUM(-1);
-  }
-  else
-  {
-    RETURN_NUM(0);
-  }
-}
-
-DEF_PRIMITIVE(num_sin)
-{
-  RETURN_NUM(sin(AS_NUM(args[0])));
-}
-
-DEF_PRIMITIVE(num_sqrt)
-{
-  RETURN_NUM(sqrt(AS_NUM(args[0])));
-}
-
-DEF_PRIMITIVE(num_toString)
-{
-  RETURN_VAL(wrenNumToString(vm, AS_NUM(args[0])));
-}
-
-DEF_PRIMITIVE(num_truncate)
-{
-  double integer;
-  modf(AS_NUM(args[0]) , &integer);
-  RETURN_NUM(integer);
 }
 
 DEF_PRIMITIVE(num_fromString)
@@ -999,63 +957,67 @@ DEF_PRIMITIVE(num_fromString)
   RETURN_NUM(number);
 }
 
-DEF_PRIMITIVE(num_negate)
+DEF_PRIMITIVE(num_pi)
 {
-  RETURN_NUM(-AS_NUM(args[0]));
+  RETURN_NUM(3.14159265358979323846);
 }
 
-DEF_PRIMITIVE(num_minus)
-{
-  if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR;
-  RETURN_NUM(AS_NUM(args[0]) - AS_NUM(args[1]));
-}
+// Defines a primitive on Num that calls infix [op] and returns [type].
+#define DEF_NUM_INFIX(name, op, type) \
+    DEF_PRIMITIVE(num_##name) \
+    { \
+      if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR; \
+      RETURN_##type(AS_NUM(args[0]) op AS_NUM(args[1])); \
+    }
 
-DEF_PRIMITIVE(num_plus)
-{
-  if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR;
-  RETURN_NUM(AS_NUM(args[0]) + AS_NUM(args[1]));
-}
+DEF_NUM_INFIX(minus,    -,  NUM)
+DEF_NUM_INFIX(plus,     +,  NUM)
+DEF_NUM_INFIX(multiply, *,  NUM)
+DEF_NUM_INFIX(divide,   /,  NUM)
+DEF_NUM_INFIX(lt,       <,  BOOL)
+DEF_NUM_INFIX(gt,       >,  BOOL)
+DEF_NUM_INFIX(lte,      <=, BOOL)
+DEF_NUM_INFIX(gte,      >=, BOOL)
 
-DEF_PRIMITIVE(num_multiply)
-{
-  if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR;
-  RETURN_NUM(AS_NUM(args[0]) * AS_NUM(args[1]));
-}
+// Defines a primitive on Num that call infix bitwise [op].
+#define DEF_NUM_BITWISE(name, op) \
+    DEF_PRIMITIVE(num_bitwise##name) \
+    { \
+      if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR; \
+      uint32_t left = (uint32_t)AS_NUM(args[0]); \
+      uint32_t right = (uint32_t)AS_NUM(args[1]); \
+      RETURN_NUM(left op right); \
+    }
 
-DEF_PRIMITIVE(num_divide)
-{
-  if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR;
-  RETURN_NUM(AS_NUM(args[0]) / AS_NUM(args[1]));
-}
+DEF_NUM_BITWISE(And,        &)
+DEF_NUM_BITWISE(Or,         |)
+DEF_NUM_BITWISE(Xor,        ^)
+DEF_NUM_BITWISE(LeftShift,  <<)
+DEF_NUM_BITWISE(RightShift, >>)
+
+// Defines a primitive method on Num that returns the result of [fn].
+#define DEF_NUM_FN(name, fn) \
+    DEF_PRIMITIVE(num_##name) \
+    { \
+      RETURN_NUM(fn(AS_NUM(args[0]))); \
+    }
+
+DEF_NUM_FN(abs,     fabs)
+DEF_NUM_FN(acos,    acos)
+DEF_NUM_FN(asin,    asin)
+DEF_NUM_FN(atan,    atan)
+DEF_NUM_FN(ceil,    ceil)
+DEF_NUM_FN(cos,     cos)
+DEF_NUM_FN(floor,   floor)
+DEF_NUM_FN(negate,  -)
+DEF_NUM_FN(sin,     sin)
+DEF_NUM_FN(sqrt,    sqrt)
+DEF_NUM_FN(tan,     tan)
 
 DEF_PRIMITIVE(num_mod)
 {
   if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR;
   RETURN_NUM(fmod(AS_NUM(args[0]), AS_NUM(args[1])));
-}
-
-DEF_PRIMITIVE(num_lt)
-{
-  if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR;
-  RETURN_BOOL(AS_NUM(args[0]) < AS_NUM(args[1]));
-}
-
-DEF_PRIMITIVE(num_gt)
-{
-  if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR;
-  RETURN_BOOL(AS_NUM(args[0]) > AS_NUM(args[1]));
-}
-
-DEF_PRIMITIVE(num_lte)
-{
-  if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR;
-  RETURN_BOOL(AS_NUM(args[0]) <= AS_NUM(args[1]));
-}
-
-DEF_PRIMITIVE(num_gte)
-{
-  if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR;
-  RETURN_BOOL(AS_NUM(args[0]) >= AS_NUM(args[1]));
 }
 
 DEF_PRIMITIVE(num_eqeq)
@@ -1073,58 +1035,7 @@ DEF_PRIMITIVE(num_bangeq)
 DEF_PRIMITIVE(num_bitwiseNot)
 {
   // Bitwise operators always work on 32-bit unsigned ints.
-  uint32_t value = (uint32_t)AS_NUM(args[0]);
-  RETURN_NUM(~value);
-}
-
-DEF_PRIMITIVE(num_bitwiseAnd)
-{
-  if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR;
-
-  // Bitwise operators always work on 32-bit unsigned ints.
-  uint32_t left = (uint32_t)AS_NUM(args[0]);
-  uint32_t right = (uint32_t)AS_NUM(args[1]);
-  RETURN_NUM(left & right);
-}
-
-DEF_PRIMITIVE(num_bitwiseOr)
-{
-  if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR;
-
-  // Bitwise operators always work on 32-bit unsigned ints.
-  uint32_t left = (uint32_t)AS_NUM(args[0]);
-  uint32_t right = (uint32_t)AS_NUM(args[1]);
-  RETURN_NUM(left | right);
-}
-
-DEF_PRIMITIVE(num_bitwiseXor)
-{
-  if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR;
-
-  // Bitwise operators always work on 32-bit unsigned ints.
-  uint32_t left = (uint32_t)AS_NUM(args[0]);
-  uint32_t right = (uint32_t)AS_NUM(args[1]);
-  RETURN_NUM(left ^ right);
-}
-
-DEF_PRIMITIVE(num_bitwiseLeftShift)
-{
-  if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR;
-
-  // Bitwise operators always work on 32-bit unsigned ints.
-  uint32_t left = (uint32_t)AS_NUM(args[0]);
-  uint32_t right = (uint32_t)AS_NUM(args[1]);
-  RETURN_NUM(left << right);
-}
-
-DEF_PRIMITIVE(num_bitwiseRightShift)
-{
-  if (!validateNum(vm, args, 1, "Right operand")) return PRIM_ERROR;
-
-  // Bitwise operators always work on 32-bit unsigned ints.
-  uint32_t left = (uint32_t)AS_NUM(args[0]);
-  uint32_t right = (uint32_t)AS_NUM(args[1]);
-  RETURN_NUM(left >> right);
+  RETURN_NUM(~(uint32_t)AS_NUM(args[0]));
 }
 
 DEF_PRIMITIVE(num_dotDot)
@@ -1133,7 +1044,6 @@ DEF_PRIMITIVE(num_dotDot)
 
   double from = AS_NUM(args[0]);
   double to = AS_NUM(args[1]);
-
   RETURN_VAL(wrenNewRange(vm, from, to, true));
 }
 
@@ -1143,8 +1053,52 @@ DEF_PRIMITIVE(num_dotDotDot)
 
   double from = AS_NUM(args[0]);
   double to = AS_NUM(args[1]);
-
   RETURN_VAL(wrenNewRange(vm, from, to, false));
+}
+
+DEF_PRIMITIVE(num_atan2)
+{
+  RETURN_NUM(atan2(AS_NUM(args[0]), AS_NUM(args[1])));
+}
+
+DEF_PRIMITIVE(num_fraction)
+{
+  double dummy;
+  RETURN_NUM(modf(AS_NUM(args[0]) , &dummy));
+}
+
+DEF_PRIMITIVE(num_isNan)
+{
+  RETURN_BOOL(isnan(AS_NUM(args[0])));
+}
+
+DEF_PRIMITIVE(num_sign)
+{
+  double value = AS_NUM(args[0]);
+  if (value > 0)
+  {
+    RETURN_NUM(1);
+  }
+  else if (value < 0)
+  {
+    RETURN_NUM(-1);
+  }
+  else
+  {
+    RETURN_NUM(0);
+  }
+}
+
+DEF_PRIMITIVE(num_toString)
+{
+  RETURN_VAL(wrenNumToString(vm, AS_NUM(args[0])));
+}
+
+DEF_PRIMITIVE(num_truncate)
+{
+  double integer;
+  modf(AS_NUM(args[0]) , &integer);
+  RETURN_NUM(integer);
 }
 
 DEF_PRIMITIVE(object_not)
@@ -1197,14 +1151,12 @@ DEF_PRIMITIVE(object_instantiate)
 
 DEF_PRIMITIVE(range_from)
 {
-  ObjRange* range = AS_RANGE(args[0]);
-  RETURN_NUM(range->from);
+  RETURN_NUM(AS_RANGE(args[0])->from);
 }
 
 DEF_PRIMITIVE(range_to)
 {
-  ObjRange* range = AS_RANGE(args[0]);
-  RETURN_NUM(range->to);
+  RETURN_NUM(AS_RANGE(args[0])->to);
 }
 
 DEF_PRIMITIVE(range_min)
@@ -1221,8 +1173,7 @@ DEF_PRIMITIVE(range_max)
 
 DEF_PRIMITIVE(range_isInclusive)
 {
-  ObjRange* range = AS_RANGE(args[0]);
-  RETURN_BOOL(range->isInclusive);
+  RETURN_BOOL(AS_RANGE(args[0])->isInclusive);
 }
 
 DEF_PRIMITIVE(range_iterate)
@@ -1280,6 +1231,49 @@ DEF_PRIMITIVE(range_toString)
   RETURN_VAL(result);
 }
 
+DEF_PRIMITIVE(string_fromCodePoint)
+{
+  if (!validateInt(vm, args, 1, "Code point")) return PRIM_ERROR;
+
+  int codePoint = (int)AS_NUM(args[1]);
+  if (codePoint < 0)
+  {
+    RETURN_ERROR("Code point cannot be negative.");
+  }
+  else if (codePoint > 0x10ffff)
+  {
+    RETURN_ERROR("Code point cannot be greater than 0x10ffff.");
+  }
+
+  RETURN_VAL(wrenStringFromCodePoint(vm, codePoint));
+}
+
+DEF_PRIMITIVE(string_byteAt)
+{
+  ObjString* string = AS_STRING(args[0]);
+
+  uint32_t index = validateIndex(vm, args, string->length, 1, "Index");
+  if (index == UINT32_MAX) return PRIM_ERROR;
+
+  RETURN_NUM((uint8_t)string->value[index]);
+}
+
+DEF_PRIMITIVE(string_codePointAt)
+{
+  ObjString* string = AS_STRING(args[0]);
+
+  uint32_t index = validateIndex(vm, args, string->length, 1, "Index");
+  if (index == UINT32_MAX) return PRIM_ERROR;
+
+  // If we are in the middle of a UTF-8 sequence, indicate that.
+  const uint8_t* bytes = (uint8_t*)string->value;
+  if ((bytes[index] & 0xc0) == 0x80) RETURN_NUM(-1);
+
+  // Decode the UTF-8 sequence.
+  RETURN_NUM(wrenUtf8Decode((uint8_t*)string->value + index,
+                            string->length - index));
+}
+
 DEF_PRIMITIVE(string_contains)
 {
   if (!validateString(vm, args, 1, "Argument")) return PRIM_ERROR;
@@ -1287,13 +1281,12 @@ DEF_PRIMITIVE(string_contains)
   ObjString* string = AS_STRING(args[0]);
   ObjString* search = AS_STRING(args[1]);
 
-  RETURN_BOOL(wrenStringFind(vm, string, search) != UINT32_MAX);
+  RETURN_BOOL(wrenStringFind(string, search) != UINT32_MAX);
 }
 
 DEF_PRIMITIVE(string_count)
 {
-  double count = AS_STRING(args[0])->length;
-  RETURN_NUM(count);
+  RETURN_NUM(AS_STRING(args[0])->length);
 }
 
 DEF_PRIMITIVE(string_endsWith)
@@ -1306,10 +1299,8 @@ DEF_PRIMITIVE(string_endsWith)
   // Corner case, if the search string is longer than return false right away.
   if (search->length > string->length) RETURN_FALSE;
 
-  int result = memcmp(string->value + string->length - search->length,
-                      search->value, search->length);
-
-  RETURN_BOOL(result == 0);
+  RETURN_BOOL(memcmp(string->value + string->length - search->length,
+                     search->value, search->length) == 0);
 }
 
 DEF_PRIMITIVE(string_indexOf)
@@ -1319,8 +1310,7 @@ DEF_PRIMITIVE(string_indexOf)
   ObjString* string = AS_STRING(args[0]);
   ObjString* search = AS_STRING(args[1]);
 
-  uint32_t index = wrenStringFind(vm, string, search);
-
+  uint32_t index = wrenStringFind(string, search);
   RETURN_NUM(index == UINT32_MAX ? -1 : (int)index);
 }
 
@@ -1350,11 +1340,34 @@ DEF_PRIMITIVE(string_iterate)
   RETURN_NUM(index);
 }
 
+DEF_PRIMITIVE(string_iterateByte)
+{
+  ObjString* string = AS_STRING(args[0]);
+
+  // If we're starting the iteration, return the first index.
+  if (IS_NULL(args[1]))
+  {
+    if (string->length == 0) RETURN_FALSE;
+    RETURN_NUM(0);
+  }
+
+  if (!validateInt(vm, args, 1, "Iterator")) return PRIM_ERROR;
+
+  if (AS_NUM(args[1]) < 0) RETURN_FALSE;
+  uint32_t index = (uint32_t)AS_NUM(args[1]);
+
+  // Advance to the next byte.
+  index++;
+  if (index >= string->length) RETURN_FALSE;
+
+  RETURN_NUM(index);
+}
+
 DEF_PRIMITIVE(string_iteratorValue)
 {
   ObjString* string = AS_STRING(args[0]);
-  int index = validateIndex(vm, args, string->length, 1, "Iterator");
-  if (index == -1) return PRIM_ERROR;
+  uint32_t index = validateIndex(vm, args, string->length, 1, "Iterator");
+  if (index == UINT32_MAX) return PRIM_ERROR;
 
   RETURN_VAL(wrenStringCodePointAt(vm, string, index));
 }
@@ -1542,33 +1555,39 @@ void wrenInitializeCore(WrenVM* vm)
 
   vm->numClass = defineClass(vm, "Num");
   PRIMITIVE(vm->numClass->obj.classObj, "fromString(_)", num_fromString);
-  PRIMITIVE(vm->numClass, "-", num_negate);
+  PRIMITIVE(vm->numClass->obj.classObj, "pi", num_pi);
   PRIMITIVE(vm->numClass, "-(_)", num_minus);
   PRIMITIVE(vm->numClass, "+(_)", num_plus);
   PRIMITIVE(vm->numClass, "*(_)", num_multiply);
   PRIMITIVE(vm->numClass, "/(_)", num_divide);
-  PRIMITIVE(vm->numClass, "%(_)", num_mod);
   PRIMITIVE(vm->numClass, "<(_)", num_lt);
   PRIMITIVE(vm->numClass, ">(_)", num_gt);
   PRIMITIVE(vm->numClass, "<=(_)", num_lte);
   PRIMITIVE(vm->numClass, ">=(_)", num_gte);
-  PRIMITIVE(vm->numClass, "~", num_bitwiseNot);
   PRIMITIVE(vm->numClass, "&(_)", num_bitwiseAnd);
   PRIMITIVE(vm->numClass, "|(_)", num_bitwiseOr);
   PRIMITIVE(vm->numClass, "^(_)", num_bitwiseXor);
   PRIMITIVE(vm->numClass, "<<(_)", num_bitwiseLeftShift);
   PRIMITIVE(vm->numClass, ">>(_)", num_bitwiseRightShift);
-  PRIMITIVE(vm->numClass, "..(_)", num_dotDot);
-  PRIMITIVE(vm->numClass, "...(_)", num_dotDotDot);
   PRIMITIVE(vm->numClass, "abs", num_abs);
+  PRIMITIVE(vm->numClass, "acos", num_acos);
+  PRIMITIVE(vm->numClass, "asin", num_asin);
+  PRIMITIVE(vm->numClass, "atan", num_atan);
   PRIMITIVE(vm->numClass, "ceil", num_ceil);
   PRIMITIVE(vm->numClass, "cos", num_cos);
   PRIMITIVE(vm->numClass, "floor", num_floor);
+  PRIMITIVE(vm->numClass, "-", num_negate);
+  PRIMITIVE(vm->numClass, "sin", num_sin);
+  PRIMITIVE(vm->numClass, "sqrt", num_sqrt);
+  PRIMITIVE(vm->numClass, "tan", num_tan);
+  PRIMITIVE(vm->numClass, "%(_)", num_mod);
+  PRIMITIVE(vm->numClass, "~", num_bitwiseNot);
+  PRIMITIVE(vm->numClass, "..(_)", num_dotDot);
+  PRIMITIVE(vm->numClass, "...(_)", num_dotDotDot);
+  PRIMITIVE(vm->numClass, "atan(_)", num_atan2);
   PRIMITIVE(vm->numClass, "fraction", num_fraction);
   PRIMITIVE(vm->numClass, "isNan", num_isNan);
   PRIMITIVE(vm->numClass, "sign", num_sign);
-  PRIMITIVE(vm->numClass, "sin", num_sin);
-  PRIMITIVE(vm->numClass, "sqrt", num_sqrt);
   PRIMITIVE(vm->numClass, "toString", num_toString);
   PRIMITIVE(vm->numClass, "truncate", num_truncate);
 
@@ -1580,13 +1599,17 @@ void wrenInitializeCore(WrenVM* vm)
   wrenInterpret(vm, "", libSource);
 
   vm->stringClass = AS_CLASS(wrenFindVariable(vm, "String"));
+  PRIMITIVE(vm->stringClass->obj.classObj, "fromCodePoint(_)", string_fromCodePoint);
   PRIMITIVE(vm->stringClass, "+(_)", string_plus);
   PRIMITIVE(vm->stringClass, "[_]", string_subscript);
+  PRIMITIVE(vm->stringClass, "byteAt(_)", string_byteAt);
+  PRIMITIVE(vm->stringClass, "codePointAt(_)", string_codePointAt);
   PRIMITIVE(vm->stringClass, "contains(_)", string_contains);
   PRIMITIVE(vm->stringClass, "count", string_count);
   PRIMITIVE(vm->stringClass, "endsWith(_)", string_endsWith);
   PRIMITIVE(vm->stringClass, "indexOf(_)", string_indexOf);
   PRIMITIVE(vm->stringClass, "iterate(_)", string_iterate);
+  PRIMITIVE(vm->stringClass, "iterateByte_(_)", string_iterateByte);
   PRIMITIVE(vm->stringClass, "iteratorValue(_)", string_iteratorValue);
   PRIMITIVE(vm->stringClass, "startsWith(_)", string_startsWith);
   PRIMITIVE(vm->stringClass, "toString", string_toString);

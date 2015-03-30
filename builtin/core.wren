@@ -1,8 +1,41 @@
 class Sequence {
+  all(f) {
+    var result = true
+    for (element in this) {
+      result = f.call(element)
+      if (!result) return result
+    }
+    return result
+  }
+
+  any(f) {
+    var result = false
+    for (element in this) {
+      result = f.call(element)
+      if (result) return result
+    }
+    return result
+  }
+
+  contains(element) {
+    for (item in this) {
+      if (element == item) return true
+    }
+    return false
+  }
+
   count {
     var result = 0
     for (element in this) {
       result = result + 1
+    }
+    return result
+  }
+
+  count(f) {
+    var result = 0
+    for (element in this) {
+      if (f.call(element)) result = result + 1
     }
     return result
   }
@@ -21,20 +54,6 @@ class Sequence {
       if (f.call(element)) result.add(element)
     }
     return result
-  }
-
-  all(f) {
-    for (element in this) {
-      if (!f.call(element)) return false
-    }
-    return true
-  }
-
-  any(f) {
-    for (element in this) {
-      if (f.call(element)) return true
-    }
-    return false
   }
 
   reduce(acc, f) {
@@ -71,9 +90,29 @@ class Sequence {
 
     return result
   }
+
+  list {
+    var result = new List
+    for (element in this) {
+      result.add(element)
+    }
+    return result
+  }
 }
 
-class String is Sequence {}
+class String is Sequence {
+  bytes { new StringByteSequence(this) }
+}
+
+class StringByteSequence is Sequence {
+  new(string) {
+    _string = string
+  }
+
+  [index] { _string.byteAt(index) }
+  iterate(iterator) { _string.iterateByte_(iterator) }
+  iteratorValue(iterator) { _string.byteAt(iterator) }
+}
 
 class List is Sequence {
   addAll(other) {
@@ -91,15 +130,6 @@ class List is Sequence {
       result.add(element)
     }
     return result
-  }
-
-  contains(element) {
-    for (item in this) {
-      if (element == item) {
-        return true
-      }
-    }
-    return false
   }
 }
 

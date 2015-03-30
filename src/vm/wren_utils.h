@@ -23,13 +23,13 @@ typedef struct {
       int count; \
       int capacity; \
     } name##Buffer; \
-    void wren##name##BufferInit(WrenVM* vm, name##Buffer* buffer); \
+    void wren##name##BufferInit(name##Buffer* buffer); \
     void wren##name##BufferClear(WrenVM* vm, name##Buffer* buffer); \
     void wren##name##BufferWrite(WrenVM* vm, name##Buffer* buffer, type data)
 
 // This should be used once for each type instantiation, somewhere in a .c file.
 #define DEFINE_BUFFER(name, type) \
-    void wren##name##BufferInit(WrenVM* vm, name##Buffer* buffer) \
+    void wren##name##BufferInit(name##Buffer* buffer) \
     { \
       buffer->data = NULL; \
       buffer->capacity = 0; \
@@ -39,7 +39,7 @@ typedef struct {
     void wren##name##BufferClear(WrenVM* vm, name##Buffer* buffer) \
     { \
       wrenReallocate(vm, buffer->data, 0, 0); \
-      wren##name##BufferInit(vm, buffer); \
+      wren##name##BufferInit(buffer); \
     } \
     \
     void wren##name##BufferWrite(WrenVM* vm, name##Buffer* buffer, type data) \
@@ -63,7 +63,7 @@ DECLARE_BUFFER(String, String);
 typedef StringBuffer SymbolTable;
 
 // Initializes the symbol table.
-void wrenSymbolTableInit(WrenVM* vm, SymbolTable* symbols);
+void wrenSymbolTableInit(SymbolTable* symbols);
 
 // Frees all dynamically allocated memory used by the symbol table, but not the
 // SymbolTable itself.
@@ -80,5 +80,18 @@ int wrenSymbolTableEnsure(WrenVM* vm, SymbolTable* symbols,
 
 // Looks up name in the symbol table. Returns its index if found or -1 if not.
 int wrenSymbolTableFind(SymbolTable* symbols, const char* name, size_t length);
+
+// Returns the number of bytes needed to encode [value] in UTF-8.
+//
+// Returns 0 if [value] is too large to encode.
+int wrenUtf8NumBytes(int value);
+
+// Encodes value as a series of bytes in [bytes], which is assumed to be large
+// enough to hold the encoded result.
+void wrenUtf8Encode(int value, uint8_t* bytes);
+
+// Decodes the UTF-8 sequence in [bytes] (which has max [length]), returning
+// the code point.
+int wrenUtf8Decode(const uint8_t* bytes, uint32_t length);
 
 #endif

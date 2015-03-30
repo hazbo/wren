@@ -5,17 +5,19 @@ Extends [Sequence](sequence.html).
 
 An indexable contiguous collection of elements. More details [here](../lists.html).
 
+## Methods
+
 ### **add**(item)
 
 Appends `item` to the end of the list.
 
 ### **clear**()
 
-Removes all items from the list.
+Removes all elements from the list.
 
 ### **count**
 
-The number of items in the list.
+The number of elements in the list.
 
 ### **insert**(index, item)
 

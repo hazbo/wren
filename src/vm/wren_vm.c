@@ -14,32 +14,30 @@
   #include "wren_io.h"
 #endif
 
+#if WREN_USE_LIB_META
+  #include "wren_meta.h"
+#endif
+
 #if WREN_DEBUG_TRACE_MEMORY || WREN_DEBUG_TRACE_GC
   #include <time.h>
 #endif
 
-// The built-in reallocation function used when one is not provided by the
-// configuration.
-static void* defaultReallocate(void* memory, size_t oldSize, size_t newSize)
-{
-  return realloc(memory, newSize);
-}
-
 WrenVM* wrenNewVM(WrenConfiguration* configuration)
 {
-  WrenReallocateFn reallocate = defaultReallocate;
+  WrenReallocateFn reallocate = realloc;
   if (configuration->reallocateFn != NULL)
   {
     reallocate = configuration->reallocateFn;
   }
 
-  WrenVM* vm = (WrenVM*)reallocate(NULL, 0, sizeof(*vm));
+  WrenVM* vm = (WrenVM*)reallocate(NULL, sizeof(*vm));
   memset(vm, 0, sizeof(WrenVM));
 
   vm->reallocate = reallocate;
+  vm->bindForeign = configuration->bindForeignMethodFn;
   vm->loadModule = configuration->loadModuleFn;
 
-  wrenSymbolTableInit(vm, &vm->methodNames);
+  wrenSymbolTableInit(&vm->methodNames);
 
   vm->nextGC = 1024 * 1024 * 10;
   if (configuration->initialHeapSize != 0)
@@ -62,18 +60,25 @@ WrenVM* wrenNewVM(WrenConfiguration* configuration)
     vm->heapScalePercent = 100 + configuration->heapGrowthPercent;
   }
 
-  // Implicitly create a "main" module for the REPL or entry script.
-  ObjModule* mainModule = wrenNewModule(vm);
-  wrenPushRoot(vm, (Obj*)mainModule);
+  ObjString* name = AS_STRING(CONST_STRING(vm, "core"));
+  wrenPushRoot(vm, (Obj*)name);
+
+  // Implicitly create a "core" module for the built in libraries.
+  ObjModule* coreModule = wrenNewModule(vm, name);
+  wrenPushRoot(vm, (Obj*)coreModule);
 
   vm->modules = wrenNewMap(vm);
-  wrenMapSet(vm, vm->modules, NULL_VAL, OBJ_VAL(mainModule));
+  wrenMapSet(vm, vm->modules, NULL_VAL, OBJ_VAL(coreModule));
 
-  wrenPopRoot(vm);
+  wrenPopRoot(vm); // mainModule.
+  wrenPopRoot(vm); // name.
 
   wrenInitializeCore(vm);
   #if WREN_USE_LIB_IO
     wrenLoadIOLibrary(vm);
+  #endif
+  #if WREN_USE_LIB_META
+    wrenLoadMetaLibrary(vm);
   #endif
 
   return vm;
@@ -81,7 +86,8 @@ WrenVM* wrenNewVM(WrenConfiguration* configuration)
 
 void wrenFreeVM(WrenVM* vm)
 {
-  // TODO: Check for already freed.
+  ASSERT(vm->methodNames.count > 0, "VM appears to have already been freed.");
+
   // Free all of the GC objects.
   Obj* obj = vm->first;
   while (obj != NULL)
@@ -208,7 +214,7 @@ void* wrenReallocate(WrenVM* vm, void* memory, size_t oldSize, size_t newSize)
   if (newSize > 0 && vm->bytesAllocated > vm->nextGC) collectGarbage(vm);
 #endif
 
-  return vm->reallocate(memory, oldSize, newSize);
+  return vm->reallocate(memory, newSize);
 }
 
 // Captures the local variable [local] into an [Upvalue]. If that local is
@@ -216,7 +222,7 @@ void* wrenReallocate(WrenVM* vm, void* memory, size_t oldSize, size_t newSize)
 // ensure that multiple closures closing over the same variable actually see
 // the same variable.) Otherwise, it will create a new open upvalue and add it
 // the fiber's list of upvalues.
-static Upvalue* captureUpvalue(WrenVM* vm, ObjFiber* fiber, Value* local)
+static ObjUpvalue* captureUpvalue(WrenVM* vm, ObjFiber* fiber, Value* local)
 {
   // If there are no open upvalues at all, we must need a new one.
   if (fiber->openUpvalues == NULL)
@@ -225,8 +231,8 @@ static Upvalue* captureUpvalue(WrenVM* vm, ObjFiber* fiber, Value* local)
     return fiber->openUpvalues;
   }
 
-  Upvalue* prevUpvalue = NULL;
-  Upvalue* upvalue = fiber->openUpvalues;
+  ObjUpvalue* prevUpvalue = NULL;
+  ObjUpvalue* upvalue = fiber->openUpvalues;
 
   // Walk towards the bottom of the stack until we find a previously existing
   // upvalue or pass where it should be.
@@ -242,7 +248,7 @@ static Upvalue* captureUpvalue(WrenVM* vm, ObjFiber* fiber, Value* local)
   // We've walked past this local on the stack, so there must not be an
   // upvalue for it already. Make a new one and link it in in the right
   // place to keep the list sorted.
-  Upvalue* createdUpvalue = wrenNewUpvalue(vm, local);
+  ObjUpvalue* createdUpvalue = wrenNewUpvalue(vm, local);
   if (prevUpvalue == NULL)
   {
     // The new one is the first one in the list.
@@ -259,7 +265,7 @@ static Upvalue* captureUpvalue(WrenVM* vm, ObjFiber* fiber, Value* local)
 
 static void closeUpvalue(ObjFiber* fiber)
 {
-  Upvalue* upvalue = fiber->openUpvalues;
+  ObjUpvalue* upvalue = fiber->openUpvalues;
 
   // Move the value into the upvalue itself and point the upvalue to it.
   upvalue->closed = *upvalue->value;
@@ -269,27 +275,87 @@ static void closeUpvalue(ObjFiber* fiber)
   fiber->openUpvalues = upvalue->next;
 }
 
-static void bindMethod(WrenVM* vm, int methodType, int symbol,
-                       ObjClass* classObj, Value methodValue)
+// Looks up a foreign method in [moduleName] on [className] with [signature].
+//
+// This will try the host's foreign method binder first. If that fails, it
+// falls back to handling the built-in modules.
+static WrenForeignMethodFn findForeignMethod(WrenVM* vm,
+                                             const char* moduleName,
+                                             const char* className,
+                                             bool isStatic,
+                                             const char* signature)
 {
-  ObjFn* methodFn = IS_FN(methodValue) ? AS_FN(methodValue)
-                                       : AS_CLOSURE(methodValue)->fn;
+  WrenForeignMethodFn fn;
 
-  // Methods are always bound against the class, and not the metaclass, even
-  // for static methods, so that constructors (which are static) get bound like
-  // instance methods.
-  wrenBindMethodCode(classObj, methodFn);
-
-  Method method;
-  method.type = METHOD_BLOCK;
-  method.fn.obj = AS_OBJ(methodValue);
-
-  if (methodType == CODE_METHOD_STATIC)
+  // Let the host try to find it first.
+  if (vm->bindForeign != NULL)
   {
-    classObj = classObj->obj.classObj;
+    fn = vm->bindForeign(vm, moduleName, className, isStatic, signature);
+    if (fn != NULL) return fn;
   }
 
+  // Otherwise, try the built-in libraries.
+  if (strcmp(moduleName, "core") == 0)
+  {
+    #if WREN_USE_LIB_IO
+    fn = wrenBindIOForeignMethod(vm, className, signature);
+    if (fn != NULL) return fn;
+    #endif
+
+    #if WREN_USE_LIB_META
+    fn = wrenBindMetaForeignMethod(vm, className, signature);
+    if (fn != NULL) return fn;
+    #endif
+  }
+
+  // TODO: Report a runtime error on failure to find it.
+  return NULL;
+}
+
+// Defines [methodValue] as a method on [classObj].
+//
+// Handles both foreign methods where [methodValue] is a string containing the
+// method's signature and Wren methods where [methodValue] is a function.
+//
+// Returns an error string if the method is a foreign method that could not be
+// found. Otherwise returns `NULL_VAL`.
+static Value bindMethod(WrenVM* vm, int methodType, int symbol,
+                       ObjModule* module, ObjClass* classObj, Value methodValue)
+{
+  Method method;
+  if (IS_STRING(methodValue))
+  {
+    const char* name = AS_CSTRING(methodValue);
+    method.type = METHOD_FOREIGN;
+    method.fn.foreign = findForeignMethod(vm, module->name->value,
+                                          classObj->name->value,
+                                          methodType == CODE_METHOD_STATIC,
+                                          name);
+
+    if (method.fn.foreign == NULL)
+    {
+      return wrenStringFormat(vm,
+          "Could not find foreign method '@' for class $ in module '$'.",
+          methodValue, classObj->name->value, module->name->value);
+    }
+  }
+  else
+  {
+    ObjFn* methodFn = IS_FN(methodValue) ? AS_FN(methodValue)
+                                         : AS_CLOSURE(methodValue)->fn;
+
+    // Methods are always bound against the class, and not the metaclass, even
+    // for static methods, so that constructors (which are static) get bound
+    // like instance methods.
+    wrenBindMethodCode(classObj, methodFn);
+
+    method.type = METHOD_BLOCK;
+    method.fn.obj = AS_OBJ(methodValue);
+  }
+
+  if (methodType == CODE_METHOD_STATIC) classObj = classObj->obj.classObj;
   wrenBindMethod(vm, classObj, symbol, method);
+  return NULL_VAL;
 }
 
 static void callForeign(WrenVM* vm, ObjFiber* fiber,
@@ -316,7 +382,7 @@ static void callForeign(WrenVM* vm, ObjFiber* fiber,
 //
 // Returns the fiber that should receive the error or `NULL` if no fiber
 // caught it.
-static ObjFiber* runtimeError(WrenVM* vm, ObjFiber* fiber, Value error)
+static ObjFiber* runtimeError(ObjFiber* fiber, Value error)
 {
   ASSERT(fiber->error == NULL, "Can only fail once.");
 
@@ -334,7 +400,7 @@ static ObjFiber* runtimeError(WrenVM* vm, ObjFiber* fiber, Value error)
   }
 
   // If we got here, nothing caught the error, so show the stack trace.
-  wrenDebugPrintStackTrace(vm, fiber);
+  wrenDebugPrintStackTrace(fiber);
   return NULL;
 }
 
@@ -387,7 +453,7 @@ static ObjFiber* loadModule(WrenVM* vm, Value name, const char* source)
   }
   else
   {
-    module = wrenNewModule(vm);
+    module = wrenNewModule(vm, AS_STRING(name));
 
     // Store it in the VM's module registry so we don't load the same module
     // multiple times.
@@ -500,6 +566,24 @@ static Value validateSuperclass(WrenVM* vm, Value name,
   return NULL_VAL;
 }
 
+// Returns `true` if [value] is an instance of [baseClass] or any of its
+// superclasses.
+static bool isInstanceOf(WrenVM* vm, Value value, ObjClass *baseClass)
+{
+  ObjClass* classObj = wrenGetClass(vm, value);
+
+  // Walk the superclass chain looking for the class.
+  do
+  {
+    if (classObj == baseClass) return true;
+
+    classObj = classObj->superclass;
+  }
+  while (classObj != NULL);
+
+  return false;
+}
+
 // The main bytecode interpreter loop. This is where the magic happens. It is
 // also, as you can imagine, highly performance critical. Returns `true` if the
 // fiber completed without error.
@@ -521,7 +605,7 @@ static bool runInterpreter(WrenVM* vm)
   #define PEEK()       (*(fiber->stackTop - 1))
   #define PEEK2()      (*(fiber->stackTop - 2))
   #define READ_BYTE()  (*ip++)
-  #define READ_SHORT() (ip += 2, (ip[-2] << 8) | ip[-1])
+  #define READ_SHORT() (ip += 2, (uint16_t)((ip[-2] << 8) | ip[-1]))
 
   // Use this before a CallFrame is pushed to store the local variables back
   // into the current one.
@@ -549,7 +633,7 @@ static bool runInterpreter(WrenVM* vm)
       do                                               \
       {                                                \
         STORE_FRAME();                                 \
-        fiber = runtimeError(vm, fiber, error);        \
+        fiber = runtimeError(fiber, error);            \
         if (fiber == NULL) return false;               \
         LOAD_FRAME();                                  \
         DISPATCH();                                    \
@@ -571,83 +655,10 @@ static bool runInterpreter(WrenVM* vm)
 
   #if WREN_COMPUTED_GOTO
 
-  // Note that the order of instructions here must exacly match the Code enum
-  // in wren_vm.h or horrendously bad things happen.
   static void* dispatchTable[] = {
-    &&code_CONSTANT,
-    &&code_NULL,
-    &&code_FALSE,
-    &&code_TRUE,
-    &&code_LOAD_LOCAL_0,
-    &&code_LOAD_LOCAL_1,
-    &&code_LOAD_LOCAL_2,
-    &&code_LOAD_LOCAL_3,
-    &&code_LOAD_LOCAL_4,
-    &&code_LOAD_LOCAL_5,
-    &&code_LOAD_LOCAL_6,
-    &&code_LOAD_LOCAL_7,
-    &&code_LOAD_LOCAL_8,
-    &&code_LOAD_LOCAL,
-    &&code_STORE_LOCAL,
-    &&code_LOAD_UPVALUE,
-    &&code_STORE_UPVALUE,
-    &&code_LOAD_MODULE_VAR,
-    &&code_STORE_MODULE_VAR,
-    &&code_LOAD_FIELD_THIS,
-    &&code_STORE_FIELD_THIS,
-    &&code_LOAD_FIELD,
-    &&code_STORE_FIELD,
-    &&code_POP,
-    &&code_DUP,
-    &&code_CALL_0,
-    &&code_CALL_1,
-    &&code_CALL_2,
-    &&code_CALL_3,
-    &&code_CALL_4,
-    &&code_CALL_5,
-    &&code_CALL_6,
-    &&code_CALL_7,
-    &&code_CALL_8,
-    &&code_CALL_9,
-    &&code_CALL_10,
-    &&code_CALL_11,
-    &&code_CALL_12,
-    &&code_CALL_13,
-    &&code_CALL_14,
-    &&code_CALL_15,
-    &&code_CALL_16,
-    &&code_SUPER_0,
-    &&code_SUPER_1,
-    &&code_SUPER_2,
-    &&code_SUPER_3,
-    &&code_SUPER_4,
-    &&code_SUPER_5,
-    &&code_SUPER_6,
-    &&code_SUPER_7,
-    &&code_SUPER_8,
-    &&code_SUPER_9,
-    &&code_SUPER_10,
-    &&code_SUPER_11,
-    &&code_SUPER_12,
-    &&code_SUPER_13,
-    &&code_SUPER_14,
-    &&code_SUPER_15,
-    &&code_SUPER_16,
-    &&code_JUMP,
-    &&code_LOOP,
-    &&code_JUMP_IF,
-    &&code_AND,
-    &&code_OR,
-    &&code_IS,
-    &&code_CLOSE_UPVALUE,
-    &&code_RETURN,
-    &&code_CLOSURE,
-    &&code_CLASS,
-    &&code_METHOD_INSTANCE,
-    &&code_METHOD_STATIC,
-    &&code_LOAD_MODULE,
-    &&code_IMPORT_VARIABLE,
-    &&code_END
+    #define OPCODE(name) &&code_##name,
+    #include "wren_opcodes.h"
+    #undef OPCODE
   };
 
   #define INTERPRET_LOOP    DISPATCH();
@@ -903,14 +914,14 @@ static bool runInterpreter(WrenVM* vm)
 
     CASE_CODE(LOAD_UPVALUE):
     {
-      Upvalue** upvalues = ((ObjClosure*)frame->fn)->upvalues;
+      ObjUpvalue** upvalues = ((ObjClosure*)frame->fn)->upvalues;
       PUSH(*upvalues[READ_BYTE()]->value);
       DISPATCH();
     }
 
     CASE_CODE(STORE_UPVALUE):
     {
-      Upvalue** upvalues = ((ObjClosure*)frame->fn)->upvalues;
+      ObjUpvalue** upvalues = ((ObjClosure*)frame->fn)->upvalues;
       *upvalues[READ_BYTE()]->value = PEEK();
       DISPATCH();
     }
@@ -1024,20 +1035,8 @@ static bool runInterpreter(WrenVM* vm)
         RUNTIME_ERROR(CONST_STRING(vm, "Right operand must be a class."));
       }
 
-      ObjClass* actual = wrenGetClass(vm, POP());
-      bool isInstance = false;
-
-      // Walk the superclass chain looking for the class.
-      while (actual != NULL)
-      {
-        if (actual == AS_CLASS(expected))
-        {
-          isInstance = true;
-          break;
-        }
-        actual = actual->superclass;
-      }
-      PUSH(BOOL_VAL(isInstance));
+      Value instance = POP();
+      PUSH(BOOL_VAL(isInstanceOf(vm, instance, AS_CLASS(expected))));
       DISPATCH();
     }
 
@@ -1162,7 +1161,9 @@ static bool runInterpreter(WrenVM* vm)
       uint16_t symbol = READ_SHORT();
       ObjClass* classObj = AS_CLASS(PEEK());
       Value method = PEEK2();
-      bindMethod(vm, instruction, symbol, classObj, method);
+      Value error = bindMethod(vm, instruction, symbol, fn->module, classObj,
+                               method);
+      if (IS_STRING(error)) RUNTIME_ERROR(error);
       DROP();
       DROP();
       DISPATCH();
@@ -1240,7 +1241,7 @@ static ObjFn* makeCallStub(WrenVM* vm, ObjModule* module, const char* signature)
                                       signature, signatureLength);
 
   uint8_t* bytecode = ALLOCATE_ARRAY(vm, uint8_t, 5);
-  bytecode[0] = CODE_CALL_0 + numParams;
+  bytecode[0] = (uint8_t)(CODE_CALL_0 + numParams);
   bytecode[1] = (method >> 8) & 0xff;
   bytecode[2] = method & 0xff;
   bytecode[3] = CODE_RETURN;
@@ -1363,7 +1364,7 @@ void wrenReleaseMethod(WrenVM* vm, WrenMethod* method)
 }
 
 // Execute [source] in the context of the core module.
-WrenInterpretResult static loadIntoCore(WrenVM* vm, const char* source)
+static WrenInterpretResult loadIntoCore(WrenVM* vm, const char* source)
 {
   ObjModule* coreModule = getCoreModule(vm);
 
@@ -1496,74 +1497,6 @@ void wrenPopRoot(WrenVM* vm)
 {
   ASSERT(vm->numTempRoots > 0, "No temporary roots to release.");
   vm->numTempRoots--;
-}
-
-static void defineMethod(WrenVM* vm, const char* className,
-                         const char* signature,
-                         WrenForeignMethodFn methodFn, bool isStatic)
-{
-  ASSERT(className != NULL, "Must provide class name.");
-
-  int length = (int)strlen(signature);
-  ASSERT(signature != NULL, "Must provide signature.");
-  ASSERT(strlen(signature) < MAX_METHOD_SIGNATURE, "Signature too long.");
-
-  ASSERT(methodFn != NULL, "Must provide method function.");
-
-  // TODO: Need to be able to define methods in classes outside the core
-  // module.
-
-  // Find or create the class to bind the method to.
-  ObjModule* coreModule = getCoreModule(vm);
-  int classSymbol = wrenSymbolTableFind(&coreModule->variableNames,
-                                        className, strlen(className));
-  ObjClass* classObj;
-
-  if (classSymbol != -1)
-  {
-    // TODO: Handle name is not class.
-    classObj = AS_CLASS(coreModule->variables.data[classSymbol]);
-  }
-  else
-  {
-    // The class doesn't already exist, so create it.
-    ObjString* nameString = AS_STRING(wrenStringFormat(vm, "$", className));
-
-    wrenPushRoot(vm, (Obj*)nameString);
-
-    // TODO: Allow passing in name for superclass?
-    classObj = wrenNewClass(vm, vm->objectClass, 0, nameString);
-    wrenDefineVariable(vm, coreModule, className, nameString->length,
-                       OBJ_VAL(classObj));
-
-    wrenPopRoot(vm);
-  }
-
-  // Bind the method.
-  int methodSymbol = wrenSymbolTableEnsure(vm, &vm->methodNames,
-                                           signature, length);
-
-  Method method;
-  method.type = METHOD_FOREIGN;
-  method.fn.foreign = methodFn;
-
-  if (isStatic) classObj = classObj->obj.classObj;
-
-  wrenBindMethod(vm, classObj, methodSymbol, method);
-}
-
-void wrenDefineMethod(WrenVM* vm, const char* className,
-                      const char* signature,
-                      WrenForeignMethodFn methodFn)
-{
-  defineMethod(vm, className, signature, methodFn, false);
-}
-
-void wrenDefineStaticMethod(WrenVM* vm, const char* className,
-                            const char* signature,
-                            WrenForeignMethodFn methodFn)
-{
-  defineMethod(vm, className, signature, methodFn, true);
 }
 
 bool wrenGetArgumentBool(WrenVM* vm, int index)

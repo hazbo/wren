@@ -45,6 +45,45 @@
 #define STACK_SIZE 1024
 #define MAX_CALL_FRAMES 256
 
+// These macros cast a Value to one of the specific value types. These do *not*
+// perform any validation, so must only be used after the Value has been
+// ensured to be the right type.
+#define AS_CLASS(value)     ((ObjClass*)AS_OBJ(value))          // ObjClass*
+#define AS_CLOSURE(value)   ((ObjClosure*)AS_OBJ(value))        // ObjClosure*
+#define AS_FIBER(v)         ((ObjFiber*)AS_OBJ(v))              // ObjFiber*
+#define AS_FN(value)        ((ObjFn*)AS_OBJ(value))             // ObjFn*
+#define AS_INSTANCE(value)  ((ObjInstance*)AS_OBJ(value))       // ObjInstance*
+#define AS_LIST(value)      ((ObjList*)AS_OBJ(value))           // ObjList*
+#define AS_MAP(value)       ((ObjMap*)AS_OBJ(value))            // ObjMap*
+#define AS_MODULE(value)    ((ObjModule*)AS_OBJ(value))         // ObjModule*
+#define AS_NUM(value)       (wrenValueToNum(value))             // double
+#define AS_RANGE(v)         ((ObjRange*)AS_OBJ(v))              // ObjRange*
+#define AS_STRING(v)        ((ObjString*)AS_OBJ(v))             // ObjString*
+#define AS_CSTRING(v)       (AS_STRING(v)->value)               // const char*
+
+// These macros promote a primitive C value to a full Wren Value. There are
+// more defined below that are specific to the Nan tagged or other
+// representation.
+#define BOOL_VAL(boolean) (boolean ? TRUE_VAL : FALSE_VAL)      // boolean
+#define NUM_VAL(num) (wrenNumToValue(num))                      // double
+#define OBJ_VAL(obj) (wrenObjectToValue((Obj*)(obj)))           // Any Obj___*
+
+// These perform type tests on a Value, returning `true` if the Value is of the
+// given type.
+#define IS_BOOL(value) (wrenIsBool(value))                      // Bool
+#define IS_CLASS(value) (wrenIsObjType(value, OBJ_CLASS))       // ObjClass
+#define IS_CLOSURE(value) (wrenIsObjType(value, OBJ_CLOSURE))   // ObjClosure
+#define IS_FIBER(value) (wrenIsObjType(value, OBJ_FIBER))       // ObjFiber
+#define IS_FN(value) (wrenIsObjType(value, OBJ_FN))             // ObjFn
+#define IS_INSTANCE(value) (wrenIsObjType(value, OBJ_INSTANCE)) // ObjInstance
+#define IS_RANGE(value) (wrenIsObjType(value, OBJ_RANGE))       // ObjRange
+#define IS_STRING(value) (wrenIsObjType(value, OBJ_STRING))     // ObjString
+
+// Creates a new string object from [text], which should be a bare C string
+// literal. This determines the length of the string automatically at compile
+// time based on the size of the character array (-1 for the terminating '\0').
+#define CONST_STRING(vm, text) wrenNewString((vm), (text), sizeof(text) - 1)
+
 // Identifies which specific type a heap-allocated object is.
 typedef enum {
   OBJ_CLASS,
@@ -104,12 +143,18 @@ typedef struct
 
 DECLARE_BUFFER(Value, Value);
 
+// A heap-allocated string object.
 typedef struct
 {
   Obj obj;
-  // Does not include the null terminator.
+
+  // Number of bytes in the string, not including the null terminator.
   uint32_t length;
+
+  // The hash value of the string's contents.
   uint32_t hash;
+
+  // Inline array of the string's bytes followed by a null terminator.
   char value[FLEXIBLE_ARRAY];
 } ObjString;
 
@@ -142,7 +187,7 @@ typedef struct sUpvalue
   // Open upvalues are stored in a linked list by the fiber. This points to the
   // next upvalue in that list.
   struct sUpvalue* next;
-} Upvalue;
+} ObjUpvalue;
 
 typedef struct
 {
@@ -171,7 +216,7 @@ typedef struct sObjFiber
   // Pointer to the first node in the linked list of open upvalues that are
   // pointing to values still on the stack. The head of the list will be the
   // upvalue closest to the top of the stack, and then the list works downwards.
-  Upvalue* openUpvalues;
+  ObjUpvalue* openUpvalues;
 
   // The fiber that ran this one. If this fiber is yielded, control will resume
   // to this one. May be `NULL`.
@@ -238,6 +283,9 @@ typedef struct
   // Symbol table for the names of all module variables. Indexes here directly
   // correspond to entries in [variables].
   SymbolTable variableNames;
+
+  // The name of the module.
+  ObjString* name;
 } ObjModule;
 
 // A first-class function object. A raw ObjFn can be used and invoked directly
@@ -278,7 +326,7 @@ typedef struct
   ObjFn* fn;
 
   // The upvalues this function has closed over.
-  Upvalue* upvalues[FLEXIBLE_ARRAY];
+  ObjUpvalue* upvalues[FLEXIBLE_ARRAY];
 } ObjClosure;
 
 typedef enum
@@ -348,16 +396,8 @@ typedef struct
 {
   Obj obj;
 
-  // TODO: Make these uint32_t to match ObjMap, or vice versa.
-
-  // The number of elements allocated.
-  int capacity;
-
-  // The number of items in the list.
-  int count;
-
-  // Pointer to a contiguous array of [capacity] elements.
-  Value* elements;
+  // The elements in the list.
+  ValueBuffer elements;
 } ObjList;
 
 typedef struct
@@ -415,81 +455,6 @@ typedef struct
   // True if [to] is included in the range.
   bool isInclusive;
 } ObjRange;
-
-
-// Value -> ObjClass*.
-#define AS_CLASS(value) ((ObjClass*)AS_OBJ(value))
-
-// Value -> ObjClosure*.
-#define AS_CLOSURE(value) ((ObjClosure*)AS_OBJ(value))
-
-// Value -> ObjFiber*.
-#define AS_FIBER(v) ((ObjFiber*)AS_OBJ(v))
-
-// Value -> ObjFn*.
-#define AS_FN(value) ((ObjFn*)AS_OBJ(value))
-
-// Value -> ObjInstance*.
-#define AS_INSTANCE(value) ((ObjInstance*)AS_OBJ(value))
-
-// Value -> ObjList*.
-#define AS_LIST(value) ((ObjList*)AS_OBJ(value))
-
-// Value -> ObjMap*.
-#define AS_MAP(value) ((ObjMap*)AS_OBJ(value))
-
-// Value -> ObjModule*.
-#define AS_MODULE(value) ((ObjModule*)AS_OBJ(value))
-
-// Value -> double.
-#define AS_NUM(value) (wrenValueToNum(value))
-
-// Value -> ObjRange*.
-#define AS_RANGE(v) ((ObjRange*)AS_OBJ(v))
-
-// Value -> ObjString*.
-#define AS_STRING(v) ((ObjString*)AS_OBJ(v))
-
-// Value -> const char*.
-#define AS_CSTRING(v) (AS_STRING(v)->value)
-
-// Convert [boolean] to a boolean [Value].
-#define BOOL_VAL(boolean) (boolean ? TRUE_VAL : FALSE_VAL)
-
-// double -> Value.
-#define NUM_VAL(num) (wrenNumToValue(num))
-
-// Convert [obj], an `Obj*`, to a [Value].
-#define OBJ_VAL(obj) (wrenObjectToValue((Obj*)(obj)))
-
-// Returns true if [value] is a bool.
-#define IS_BOOL(value) (wrenIsBool(value))
-
-// Returns true if [value] is a class.
-#define IS_CLASS(value) (wrenIsObjType(value, OBJ_CLASS))
-
-// Returns true if [value] is a closure.
-#define IS_CLOSURE(value) (wrenIsObjType(value, OBJ_CLOSURE))
-
-// Returns true if [value] is a fiber.
-#define IS_FIBER(value) (wrenIsObjType(value, OBJ_FIBER))
-
-// Returns true if [value] is a function object.
-#define IS_FN(value) (wrenIsObjType(value, OBJ_FN))
-
-// Returns true if [value] is an instance.
-#define IS_INSTANCE(value) (wrenIsObjType(value, OBJ_INSTANCE))
-
-// Returns true if [value] is a range object.
-#define IS_RANGE(value) (wrenIsObjType(value, OBJ_RANGE))
-
-// Returns true if [value] is a string object.
-#define IS_STRING(value) (wrenIsObjType(value, OBJ_STRING))
-
-// Creates a new string object from [text], which should be a bare C string
-// literal. This determines the length of the string automatically at compile
-// time based on the size of the character array -1 for the terminating '\0'.
-#define CONST_STRING(vm, text) wrenNewString((vm), (text), sizeof(text) - 1)
 
 // An IEEE 754 double-precision float is a 64-bit value with bits laid out like:
 //
@@ -669,16 +634,13 @@ Value wrenNewInstance(WrenVM* vm, ObjClass* classObj);
 
 // Creates a new list with [numElements] elements (which are left
 // uninitialized.)
-ObjList* wrenNewList(WrenVM* vm, int numElements);
-
-// Adds [value] to [list], reallocating and growing its storage if needed.
-void wrenListAdd(WrenVM* vm, ObjList* list, Value value);
+ObjList* wrenNewList(WrenVM* vm, uint32_t numElements);
 
 // Inserts [value] in [list] at [index], shifting down the other elements.
-void wrenListInsert(WrenVM* vm, ObjList* list, Value value, int index);
+void wrenListInsert(WrenVM* vm, ObjList* list, Value value, uint32_t index);
 
 // Removes and returns the item at [index] from [list].
-Value wrenListRemoveAt(WrenVM* vm, ObjList* list, int index);
+Value wrenListRemoveAt(WrenVM* vm, ObjList* list, uint32_t index);
 
 // Creates a new empty map.
 ObjMap* wrenNewMap(WrenVM* vm);
@@ -697,7 +659,7 @@ void wrenMapClear(WrenVM* vm, ObjMap* map);
 Value wrenMapRemoveKey(WrenVM* vm, ObjMap* map, Value key);
 
 // Creates a new module.
-ObjModule* wrenNewModule(WrenVM* vm);
+ObjModule* wrenNewModule(WrenVM* vm, ObjString* name);
 
 // Creates a new range from [from] to [to].
 Value wrenNewRange(WrenVM* vm, double from, double to, bool isInclusive);
@@ -721,6 +683,9 @@ Value wrenNumToString(WrenVM* vm, double value);
 // @ - A Wren string object.
 Value wrenStringFormat(WrenVM* vm, const char* format, ...);
 
+// Creates a new string containing the UTF-8 encoding of [value].
+Value wrenStringFromCodePoint(WrenVM* vm, int value);
+
 // Creates a new string containing the code point in [string] starting at byte
 // [index]. If [index] points into the middle of a UTF-8 sequence, returns an
 // empty string.
@@ -729,10 +694,10 @@ Value wrenStringCodePointAt(WrenVM* vm, ObjString* string, uint32_t index);
 // Search for the first occurence of [needle] within [haystack] and returns its
 // zero-based offset. Returns `UINT32_MAX` if [haystack] does not contain
 // [needle].
-uint32_t wrenStringFind(WrenVM* vm, ObjString* haystack, ObjString* needle);
+uint32_t wrenStringFind(ObjString* haystack, ObjString* needle);
 
 // Creates a new open upvalue pointing to [value] on the stack.
-Upvalue* wrenNewUpvalue(WrenVM* vm, Value* value);
+ObjUpvalue* wrenNewUpvalue(WrenVM* vm, Value* value);
 
 // Mark [value] as reachable and still in use. This should only be called
 // during the sweep phase of a garbage collection.
@@ -741,6 +706,10 @@ void wrenMarkValue(WrenVM* vm, Value value);
 // Mark [obj] as reachable and still in use. This should only be called
 // during the sweep phase of a garbage collection.
 void wrenMarkObj(WrenVM* vm, Obj* obj);
+
+// Mark the values in [buffer] as reachable and still in use. This should only
+// be called during the sweep phase of a garbage collection.
+void wrenMarkBuffer(WrenVM* vm, ValueBuffer* buffer);
 
 // Releases all memory owned by [obj], including [obj] itself.
 void wrenFreeObj(WrenVM* vm, Obj* obj);
