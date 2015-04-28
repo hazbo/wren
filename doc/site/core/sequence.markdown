@@ -54,10 +54,18 @@ and counting the number of times the returned value evaluates to `true`.
     [1, 2, 3].count {|n| n > 2} // 1.
     [1, 2, 3].count {|n| n < 4} // 3.
 
+### **each**(function)
+
+Iterates over the sequence, passing each element to the given `function`.
+
+    :::dart
+    ["one", "two", "three"].each {|word| IO.print(word) }
+
 ### **join**(sep)
 
-Returns a string representation of the list. The string representations of the
-elements in the list is concatenated with intervening occurrences of `sep`.
+Returns a string representation of the sequence. The string representations of
+the elements in the sequence is concatenated with intervening occurrences of
+`sep`.
 
 It is a runtime error if `sep` is not a string.
 
@@ -65,40 +73,84 @@ It is a runtime error if `sep` is not a string.
 
 Calls `join` with the empty string as the separator.
 
-### **list**
-
-Creates a [list](list.html) containing all the elements in the sequence.
-
-    :::dart
-    (1..3).list  // [1, 2, 3]
-
 ### **map**(transformation)
 
-Creates a new list by applying `transformation` to each element in the
-sequence.
-
-Iterates over the sequence, passing each element to the function
-`transformation`. Generates a new list from the result of each of those calls.
+Creates a new sequence that applies the `transformation` to each element in the
+original sequence while it is iterated.
 
     :::dart
-    [1, 2, 3].map {|n| n * 2} // [2, 4, 6].
+    var doubles = [1, 2, 3].map {|n| n * 2 }
+    for (n in doubles) {
+      IO.print(n) // "2", "4", "6".
+    }
+
+The returned sequence is *lazy*. It only applies the mapping when you iterate
+over the sequence, and it does so by holding a reference to the original
+sequence.
+
+This means you can use `map(_)` for things like infinite sequences or sequences
+that have side effects when you iterate over them. But it also means that
+changes to the original sequence will be reflected in the mapped sequence.
+
+To force eager evaluation, just call `.toList` on the result.
+
+    :::dart
+    var numbers = [1, 2, 3]
+    var doubles = numbers.map {|n| n * 2 }.toList
+    numbers.add(4)
+    IO.print(doubles) // [2, 4, 6].
 
 ### **reduce**(function)
 
-Reduces the sequence down to a single value. `function` is a function that takes two arguments, the accumulator and sequence item and returns the new accumulator value. The accumulator is initialized from the first item in the sequence. Then, the function is invoked on each remaining item in the sequence, iteratively updating the accumulator.
+Reduces the sequence down to a single value. `function` is a function that takes
+two arguments, the accumulator and sequence item and returns the new accumulator
+value. The accumulator is initialized from the first item in the sequence. Then,
+the function is invoked on each remaining item in the sequence, iteratively
+updating the accumulator.
 
 It is a runtime error to call this on an empty sequence.
 
 ### **reduce**(seed, function)
 
-Similar to above, but uses `seed` for the initial value of the accumulator. If the sequence is empty, returns `seed`.
+Similar to above, but uses `seed` for the initial value of the accumulator. If
+the sequence is empty, returns `seed`.
+
+### **toList**
+
+Creates a [list](list.html) containing all the elements in the sequence.
+
+    :::dart
+    (1..3).toList  // [1, 2, 3].
+
+If the sequence is already a list, this creates a copy of it.
 
 ### **where**(predicate)
 
-Produces a new list containing only the elements in the sequence that pass the
-`predicate`.
+Creates a new sequence containing only the elements from the original sequence
+that pass the `predicate`.
 
-Iterates over the sequence, passing each element to the function `predicate`.
-If it returns `true`, adds the element to the result list.
+During iteration, each element in the original sequence is passed to the
+function `predicate`. If it returns `false`, the element is skipped.
 
-    (1..10).where {|n| n % 2 == 1} // [1, 3, 5, 7, 9].
+    :::dart
+    var odds = (1..10).where {|n| n % 2 == 1 }
+    for (n in odds) {
+      IO.print(n) // "1", "3", "5", "7", "9".
+    }
+
+The returned sequence is *lazy*. It only applies the filtering when you iterate
+over the sequence, and it does so by holding a reference to the original
+sequence.
+
+This means you can use `where(_)` for things like infinite sequences or
+sequences that have side effects when you iterate over them. But it also means
+that changes to the original sequence will be reflected in the filtered
+sequence.
+
+To force eager evaluation, just call `.toList` on the result.
+
+    :::dart
+    var numbers = [1, 2, 3, 4, 5, 6]
+    var odds = numbers.where {|n| n % 2 == 1 }.toList
+    numbers.add(7)
+    IO.print(odds) // [1, 3, 5].

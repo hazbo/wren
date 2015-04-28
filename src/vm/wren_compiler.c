@@ -149,6 +149,9 @@ typedef struct
   // If subsequent newline tokens should be discarded.
   bool skipNewlines;
 
+  // Whether compile errors should be printed to stderr or discarded.
+  bool printErrors;
+
   // If a syntax or compile error has occurred.
   bool hasError;
 
@@ -278,6 +281,7 @@ struct sCompiler
 static void lexError(Parser* parser, const char* format, ...)
 {
   parser->hasError = true;
+  if (!parser->printErrors) return;
 
   fprintf(stderr, "[%s line %d] Error: ",
           parser->sourcePath->value, parser->currentLine);
@@ -301,6 +305,7 @@ static void lexError(Parser* parser, const char* format, ...)
 static void error(Compiler* compiler, const char* format, ...)
 {
   compiler->parser->hasError = true;
+  if (!compiler->parser->printErrors) return;
 
   Token* token = &compiler->parser->previous;
 
@@ -1020,11 +1025,12 @@ static int defineLocal(Compiler* compiler, const char* name, int length)
   return compiler->numLocals++;
 }
 
-// Declares a variable in the current scope with the name of the previously
-// consumed token. Returns its symbol.
-static int declareVariable(Compiler* compiler)
+// Declares a variable in the current scope whose name is the given token.
+//
+// If [token] is `NULL`, uses the previously consumed token. Returns its symbol.
+static int declareVariable(Compiler* compiler, Token* token)
 {
-  Token* token = &compiler->parser->previous;
+  if (token == NULL) token = &compiler->parser->previous;
 
   if (token->length > MAX_VARIABLE_NAME)
   {
@@ -1083,7 +1089,7 @@ static int declareVariable(Compiler* compiler)
 static int declareNamedVariable(Compiler* compiler)
 {
   consume(compiler, TOKEN_NAME, "Expect variable name.");
-  return declareVariable(compiler);
+  return declareVariable(compiler, NULL);
 }
 
 // Stores a variable with the previously defined symbol in the current scope.
@@ -1291,6 +1297,8 @@ static ObjFn* endCompiler(Compiler* compiler,
   // anyway.
   if (compiler->parser->hasError)
   {
+    wrenSetCompiler(compiler->parser->vm, compiler->parent);
+
     // Free the code since it won't be used.
     freeCompiler(compiler);
     return NULL;
@@ -1440,7 +1448,7 @@ static void patchJump(Compiler* compiler, int offset)
 
 // Parses a block body, after the initial "{" has been consumed.
 //
-// Returns true if it was a expression body, false if it was an statement body.
+// Returns true if it was a expression body, false if it was a statement body.
 // (More precisely, returns true if a value was left on the stack. An empty
 // block returns false.)
 static bool finishBlock(Compiler* compiler)
@@ -1514,7 +1522,7 @@ static void validateNumParameters(Compiler* compiler, int numArgs)
 
 // Parses the rest of a comma-separated parameter list after the opening
 // delimeter. Updates `arity` in [signature] with the number of parameters.
-static void  finishParameterList(Compiler* compiler, Signature* signature)
+static void finishParameterList(Compiler* compiler, Signature* signature)
 {
   do
   {
@@ -1991,7 +1999,7 @@ static void staticField(Compiler* compiler, bool allowAssignment)
     // define it as a variable in the scope surrounding the class definition.
     if (resolveLocal(classCompiler, token->start, token->length) == -1)
     {
-      int symbol = declareVariable(classCompiler);
+      int symbol = declareVariable(classCompiler, NULL);
 
       // Implicitly initialize it to null.
       emit(classCompiler, CODE_NULL);
@@ -3071,8 +3079,7 @@ static void import(Compiler* compiler)
   // Compile the comma-separated list of variables to import.
   do
   {
-    consume(compiler, TOKEN_NAME, "Expect name of variable to import.");
-    int slot = declareVariable(compiler);
+    int slot = declareNamedVariable(compiler);
 
     // Define a string constant for the variable name.
     int variableConstant = addConstant(compiler,
@@ -3091,8 +3098,10 @@ static void import(Compiler* compiler)
 
 static void variableDefinition(Compiler* compiler)
 {
-  // TODO: Variable should not be in scope until after initializer.
-  int symbol = declareNamedVariable(compiler);
+  // Grab its name, but don't declare it yet. A (local) variable shouldn't be
+  // in scope in its own initializer.
+  consume(compiler, TOKEN_NAME, "Expect variable name.");
+  Token nameToken = compiler->parser->previous;
 
   // Compile the initializer.
   if (match(compiler, TOKEN_EQ))
@@ -3105,6 +3114,8 @@ static void variableDefinition(Compiler* compiler)
     null(compiler, false);
   }
 
+  // Now put it in scope.
+  int symbol = declareVariable(compiler, &nameToken);
   defineVariable(compiler, symbol);
 }
 
@@ -3131,10 +3142,8 @@ void definition(Compiler* compiler)
   block(compiler);
 }
 
-// Parses [source] to a "function" (a chunk of top-level code) for execution by
-// [vm].
-ObjFn* wrenCompile(WrenVM* vm, ObjModule* module,
-                   const char* sourcePath, const char* source)
+ObjFn* wrenCompile(WrenVM* vm, ObjModule* module, const char* sourcePath,
+                   const char* source, bool printErrors)
 {
   Value sourcePathValue = wrenStringFormat(vm, "$", sourcePath);
   wrenPushRoot(vm, AS_OBJ(sourcePathValue));
@@ -3158,6 +3167,7 @@ ObjFn* wrenCompile(WrenVM* vm, ObjModule* module,
 
   // Ignore leading newlines.
   parser.skipNewlines = true;
+  parser.printErrors = printErrors;
   parser.hasError = false;
 
   wrenByteBufferInit(&parser.string);

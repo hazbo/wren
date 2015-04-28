@@ -301,11 +301,6 @@ static WrenForeignMethodFn findForeignMethod(WrenVM* vm,
     fn = wrenBindIOForeignMethod(vm, className, signature);
     if (fn != NULL) return fn;
     #endif
-
-    #if WREN_USE_LIB_META
-    fn = wrenBindMetaForeignMethod(vm, className, signature);
-    if (fn != NULL) return fn;
-    #endif
   }
 
   // TODO: Report a runtime error on failure to find it.
@@ -345,8 +340,8 @@ static Value bindMethod(WrenVM* vm, int methodType, int symbol,
                                          : AS_CLOSURE(methodValue)->fn;
 
     // Methods are always bound against the class, and not the metaclass, even
-    // for static methods, so that constructors (which are static) get bound
-    // like instance methods.
+    // for static methods, because static methods don't have instance fields
+    // anyway.
     wrenBindMethodCode(classObj, methodFn);
 
     method.type = METHOD_BLOCK;
@@ -470,7 +465,7 @@ static ObjFiber* loadModule(WrenVM* vm, Value name, const char* source)
     }
   }
 
-  ObjFn* fn = wrenCompile(vm, module, AS_CSTRING(name), source);
+  ObjFn* fn = wrenCompile(vm, module, AS_CSTRING(name), source, true);
   if (fn == NULL)
   {
     // TODO: Should we still store the module even if it didn't compile?
@@ -1134,8 +1129,8 @@ static bool runInterpreter(WrenVM* vm)
 
       int numFields = READ_BYTE();
 
-      ObjClass* classObj = wrenNewClass(vm, superclass, numFields,
-                                        AS_STRING(name));
+      Value classObj = OBJ_VAL(wrenNewClass(vm, superclass, numFields,
+                                            AS_STRING(name)));
 
       // Don't pop the superclass and name off the stack until the subclass is
       // done being created, to make sure it doesn't get collected.
@@ -1151,7 +1146,7 @@ static bool runInterpreter(WrenVM* vm)
             "ones.", name));
       }
 
-      PUSH(OBJ_VAL(classObj));
+      PUSH(classObj);
       DISPATCH();
     }
 
@@ -1224,6 +1219,8 @@ static bool runInterpreter(WrenVM* vm)
   UNREACHABLE();
   return false;
 }
+#undef READ_BYTE
+#undef READ_SHORT
 
 // Creates an [ObjFn] that invokes a method with [signature] when called.
 static ObjFn* makeCallStub(WrenVM* vm, ObjModule* module, const char* signature)
@@ -1368,7 +1365,7 @@ static WrenInterpretResult loadIntoCore(WrenVM* vm, const char* source)
 {
   ObjModule* coreModule = getCoreModule(vm);
 
-  ObjFn* fn = wrenCompile(vm, coreModule, "", source);
+  ObjFn* fn = wrenCompile(vm, coreModule, "", source, true);
   if (fn == NULL) return WREN_RESULT_COMPILE_ERROR;
 
   wrenPushRoot(vm, (Obj*)fn);

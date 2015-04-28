@@ -75,11 +75,44 @@ Similar to `Fiber.yield` but provides a value to return to the parent fiber's
 
 ### **call**()
 
-**TODO**
+Starts or resumes the fiber if it is in a paused state.
+
+    :::dart
+    var fiber = new Fiber {
+      IO.print("Fiber called")
+      Fiber.yield()
+      IO.print("Fiber called again")
+    }
+
+    fiber.call() // Start it.
+    fiber.call() // Resume after the yield() call.
+
+When the called fiber yields, control is transferred back to the fiber that
+called it.
+
+If the called fiber is resuming from a yield, the `yield()` method returns
+`null` in the called fiber.
+
+    :::dart
+    var fiber = new Fiber {
+      IO.print(Fiber.yield())
+    }
+
+    fiber.call()
+    fiber.call() // Prints "null".
 
 ### **call**(value)
 
-**TODO**
+Invokes the fiber or resumes the fiber if it is in a paused state and sets
+`value` as the returned value of the fiber's call to `yield`.
+
+    :::dart
+    var fiber = new Fiber {
+      IO.print(Fiber.yield())
+    }
+
+    fiber.call()
+    fiber.call("value") // Prints "value".
 
 ### **isDone**
 

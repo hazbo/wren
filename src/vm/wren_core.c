@@ -7,43 +7,17 @@
 
 #include "wren_common.h"
 #include "wren_core.h"
+#include "wren_primitive.h"
 #include "wren_value.h"
 
-// Binds a primitive method named [name] (in Wren) implemented using C function
-// [fn] to `ObjClass` [cls].
-#define PRIMITIVE(cls, name, function) \
-    { \
-      int symbol = wrenSymbolTableEnsure(vm, \
-          &vm->methodNames, name, strlen(name)); \
-      Method method; \
-      method.type = METHOD_PRIMITIVE; \
-      method.fn.primitive = prim_##function; \
-      wrenBindMethod(vm, cls, symbol, method); \
-    }
-
-// Defines a primitive method whose C function name is [name]. This abstracts
-// the actual type signature of a primitive function and makes it clear which C
-// functions are invoked as primitives.
-#define DEF_PRIMITIVE(name) \
-    static PrimitiveResult prim_##name(WrenVM* vm, ObjFiber* fiber, Value* args)
-
-#define RETURN_VAL(value)   do { args[0] = value; return PRIM_VALUE; } while (0)
-
-#define RETURN_OBJ(obj)     RETURN_VAL(OBJ_VAL(obj))
-#define RETURN_BOOL(value)  RETURN_VAL(BOOL_VAL(value))
-#define RETURN_FALSE        RETURN_VAL(FALSE_VAL)
-#define RETURN_NULL         RETURN_VAL(NULL_VAL)
-#define RETURN_NUM(value)   RETURN_VAL(NUM_VAL(value))
-#define RETURN_TRUE         RETURN_VAL(TRUE_VAL)
-
-#define RETURN_ERROR(msg) \
-    do { \
-      args[0] = wrenStringFormat(vm, "$", msg); \
-      return PRIM_ERROR; \
-    } while (0);
-
 // This string literal is generated automatically from core. Do not edit.
-static const char* libSource =
+static const char* coreLibSource =
+"class Bool {}\n"
+"class Fiber {}\n"
+"class Fn {}\n"
+"class Null {}\n"
+"class Num {}\n"
+"\n"
 "class Sequence {\n"
 "  all(f) {\n"
 "    var result = true\n"
@@ -86,21 +60,15 @@ static const char* libSource =
 "    return result\n"
 "  }\n"
 "\n"
-"  map(f) {\n"
-"    var result = new List\n"
+"  each(f) {\n"
 "    for (element in this) {\n"
-"      result.add(f.call(element))\n"
+"      f.call(element)\n"
 "    }\n"
-"    return result\n"
 "  }\n"
 "\n"
-"  where(f) {\n"
-"    var result = new List\n"
-"    for (element in this) {\n"
-"      if (f.call(element)) result.add(element)\n"
-"    }\n"
-"    return result\n"
-"  }\n"
+"  map(transformation) { new MapSequence(this, transformation) }\n"
+"\n"
+"  where(predicate) { new WhereSequence(this, predicate) }\n"
 "\n"
 "  reduce(acc, f) {\n"
 "    for (element in this) {\n"
@@ -137,13 +105,39 @@ static const char* libSource =
 "    return result\n"
 "  }\n"
 "\n"
-"  list {\n"
+"  toList {\n"
 "    var result = new List\n"
 "    for (element in this) {\n"
 "      result.add(element)\n"
 "    }\n"
 "    return result\n"
 "  }\n"
+"}\n"
+"\n"
+"class MapSequence is Sequence {\n"
+"  new(sequence, fn) {\n"
+"    _sequence = sequence\n"
+"    _fn = fn\n"
+"  }\n"
+"\n"
+"  iterate(iterator) { _sequence.iterate(iterator) }\n"
+"  iteratorValue(iterator) { _fn.call(_sequence.iteratorValue(iterator)) }\n"
+"}\n"
+"\n"
+"class WhereSequence is Sequence {\n"
+"  new(sequence, fn) {\n"
+"    _sequence = sequence\n"
+"    _fn = fn\n"
+"  }\n"
+"\n"
+"  iterate(iterator) {\n"
+"    while (iterator = _sequence.iterate(iterator)) {\n"
+"      if (_fn.call(_sequence.iteratorValue(iterator))) break\n"
+"    }\n"
+"    return iterator\n"
+"  }\n"
+"\n"
+"  iteratorValue(iterator) { _sequence.iteratorValue(iterator) }\n"
 "}\n"
 "\n"
 "class String is Sequence {\n"
@@ -216,164 +210,6 @@ static const char* libSource =
 "}\n"
 "\n"
 "class Range is Sequence {}\n";
-
-// Validates that the given argument in [args] is a function. Returns true if
-// it is. If not, reports an error and returns false.
-static bool validateFn(WrenVM* vm, Value* args, int index, const char* argName)
-{
-  if (IS_FN(args[index]) || IS_CLOSURE(args[index])) return true;
-
-  args[0] = wrenStringFormat(vm, "$ must be a function.", argName);
-  return false;
-}
-
-// Validates that the given argument in [args] is a Num. Returns true if it is.
-// If not, reports an error and returns false.
-static bool validateNum(WrenVM* vm, Value* args, int index, const char* argName)
-{
-  if (IS_NUM(args[index])) return true;
-
-  args[0] = wrenStringFormat(vm, "$ must be a number.", argName);
-  return false;
-}
-
-// Validates that [value] is an integer. Returns true if it is. If not, reports
-// an error and returns false.
-static bool validateIntValue(WrenVM* vm, Value* args, double value,
-                             const char* argName)
-{
-  if (trunc(value) == value) return true;
-
-  args[0] = wrenStringFormat(vm, "$ must be an integer.", argName);
-  return false;
-}
-
-// Validates that the given argument in [args] is an integer. Returns true if
-// it is. If not, reports an error and returns false.
-static bool validateInt(WrenVM* vm, Value* args, int index, const char* argName)
-{
-  // Make sure it's a number first.
-  if (!validateNum(vm, args, index, argName)) return false;
-
-  return validateIntValue(vm, args, AS_NUM(args[index]), argName);
-}
-
-// Validates that [value] is an integer within `[0, count)`. Also allows
-// negative indices which map backwards from the end. Returns the valid positive
-// index value. If invalid, reports an error and returns `UINT32_MAX`.
-static uint32_t validateIndexValue(WrenVM* vm, Value* args, uint32_t count,
-                                    double value, const char* argName)
-{
-  if (!validateIntValue(vm, args, value, argName)) return UINT32_MAX;
-
-  // Negative indices count from the end.
-  if (value < 0) value = count + value;
-
-  // Check bounds.
-  if (value >= 0 && value < count) return (uint32_t)value;
-
-  args[0] = wrenStringFormat(vm, "$ out of bounds.", argName);
-  return UINT32_MAX;
-}
-
-// Validates that [key] is a valid object for use as a map key. Returns true if
-// it is. If not, reports an error and returns false.
-static bool validateKey(WrenVM* vm, Value* args, int index)
-{
-  Value arg = args[index];
-  if (IS_BOOL(arg) || IS_CLASS(arg) || IS_NULL(arg) ||
-      IS_NUM(arg) || IS_RANGE(arg) || IS_STRING(arg))
-  {
-    return true;
-  }
-
-  args[0] = CONST_STRING(vm, "Key must be a value type.");
-  return false;
-}
-
-// Validates that the argument at [argIndex] is an integer within `[0, count)`.
-// Also allows negative indices which map backwards from the end. Returns the
-// valid positive index value. If invalid, reports an error and returns
-// `UINT32_MAX`.
-static uint32_t validateIndex(WrenVM* vm, Value* args, uint32_t count,
-                              int arg, const char* argName)
-{
-  if (!validateNum(vm, args, arg, argName)) return UINT32_MAX;
-
-  return validateIndexValue(vm, args, count, AS_NUM(args[arg]), argName);
-}
-
-// Validates that the given argument in [args] is a String. Returns true if it
-// is. If not, reports an error and returns false.
-static bool validateString(WrenVM* vm, Value* args, int index,
-                           const char* argName)
-{
-  if (IS_STRING(args[index])) return true;
-
-  args[0] = wrenStringFormat(vm, "$ must be a string.", argName);
-  return false;
-}
-
-// Given a [range] and the [length] of the object being operated on, determines
-// the series of elements that should be chosen from the underlying object.
-// Handles ranges that count backwards from the end as well as negative ranges.
-//
-// Returns the index from which the range should start or `UINT32_MAX` if the
-// range is invalid. After calling, [length] will be updated with the number of
-// elements in the resulting sequence. [step] will be direction that the range
-// is going: `1` if the range is increasing from the start index or `-1` if the
-// range is decreasing.
-static uint32_t calculateRange(WrenVM* vm, Value* args, ObjRange* range,
-                               uint32_t* length, int* step)
-{
-  *step = 0;
-
-  // Corner case: an empty range at zero is allowed on an empty sequence.
-  // This way, list[0..-1] and list[0...list.count] can be used to copy a list
-  // even when empty.
-  if (*length == 0 && range->from == 0 &&
-      range->to == (range->isInclusive ? -1 : 0)) {
-    return 0;
-  }
-
-  uint32_t from = validateIndexValue(vm, args, *length, range->from,
-                                     "Range start");
-  if (from == UINT32_MAX) return UINT32_MAX;
-
-  // Bounds check the end manually to handle exclusive ranges.
-  double value = range->to;
-  if (!validateIntValue(vm, args, value, "Range end")) return UINT32_MAX;
-
-  // Negative indices count from the end.
-  if (value < 0) value = *length + value;
-
-  // Convert the exclusive range to an inclusive one.
-  if (!range->isInclusive)
-  {
-    // An exclusive range with the same start and end points is empty.
-    if (value == from)
-    {
-      *length = 0;
-      return from;
-    }
-
-    // Shift the endpoint to make it inclusive, handling both increasing and
-    // decreasing ranges.
-    value += value >= from ? -1 : 1;
-  }
-
-  // Check bounds.
-  if (value < 0 || value >= *length)
-  {
-    args[0] = CONST_STRING(vm, "Range end out of bounds.");
-    return UINT32_MAX;
-  }
-
-  uint32_t to = (uint32_t)value;
-  *length = abs(from - to) + 1;
-  *step = from < to ? 1 : -1;
-  return from;
-}
 
 DEF_PRIMITIVE(bool_not)
 {
@@ -649,7 +485,7 @@ DEF_PRIMITIVE(fn_arity)
   RETURN_NUM(AS_FN(args[0])->arity);
 }
 
-static PrimitiveResult callFunction(WrenVM* vm, Value* args, int numArgs)
+static PrimitiveResult callFn(WrenVM* vm, Value* args, int numArgs)
 {
   ObjFn* fn;
   if (IS_CLOSURE(args[0]))
@@ -666,23 +502,23 @@ static PrimitiveResult callFunction(WrenVM* vm, Value* args, int numArgs)
   return PRIM_CALL;
 }
 
-DEF_PRIMITIVE(fn_call0) { return callFunction(vm, args, 0); }
-DEF_PRIMITIVE(fn_call1) { return callFunction(vm, args, 1); }
-DEF_PRIMITIVE(fn_call2) { return callFunction(vm, args, 2); }
-DEF_PRIMITIVE(fn_call3) { return callFunction(vm, args, 3); }
-DEF_PRIMITIVE(fn_call4) { return callFunction(vm, args, 4); }
-DEF_PRIMITIVE(fn_call5) { return callFunction(vm, args, 5); }
-DEF_PRIMITIVE(fn_call6) { return callFunction(vm, args, 6); }
-DEF_PRIMITIVE(fn_call7) { return callFunction(vm, args, 7); }
-DEF_PRIMITIVE(fn_call8) { return callFunction(vm, args, 8); }
-DEF_PRIMITIVE(fn_call9) { return callFunction(vm, args, 9); }
-DEF_PRIMITIVE(fn_call10) { return callFunction(vm, args, 10); }
-DEF_PRIMITIVE(fn_call11) { return callFunction(vm, args, 11); }
-DEF_PRIMITIVE(fn_call12) { return callFunction(vm, args, 12); }
-DEF_PRIMITIVE(fn_call13) { return callFunction(vm, args, 13); }
-DEF_PRIMITIVE(fn_call14) { return callFunction(vm, args, 14); }
-DEF_PRIMITIVE(fn_call15) { return callFunction(vm, args, 15); }
-DEF_PRIMITIVE(fn_call16) { return callFunction(vm, args, 16); }
+DEF_PRIMITIVE(fn_call0) { return callFn(vm, args, 0); }
+DEF_PRIMITIVE(fn_call1) { return callFn(vm, args, 1); }
+DEF_PRIMITIVE(fn_call2) { return callFn(vm, args, 2); }
+DEF_PRIMITIVE(fn_call3) { return callFn(vm, args, 3); }
+DEF_PRIMITIVE(fn_call4) { return callFn(vm, args, 4); }
+DEF_PRIMITIVE(fn_call5) { return callFn(vm, args, 5); }
+DEF_PRIMITIVE(fn_call6) { return callFn(vm, args, 6); }
+DEF_PRIMITIVE(fn_call7) { return callFn(vm, args, 7); }
+DEF_PRIMITIVE(fn_call8) { return callFn(vm, args, 8); }
+DEF_PRIMITIVE(fn_call9) { return callFn(vm, args, 9); }
+DEF_PRIMITIVE(fn_call10) { return callFn(vm, args, 10); }
+DEF_PRIMITIVE(fn_call11) { return callFn(vm, args, 11); }
+DEF_PRIMITIVE(fn_call12) { return callFn(vm, args, 12); }
+DEF_PRIMITIVE(fn_call13) { return callFn(vm, args, 13); }
+DEF_PRIMITIVE(fn_call14) { return callFn(vm, args, 14); }
+DEF_PRIMITIVE(fn_call15) { return callFn(vm, args, 15); }
+DEF_PRIMITIVE(fn_call16) { return callFn(vm, args, 16); }
 
 DEF_PRIMITIVE(fn_toString)
 {
@@ -942,7 +778,7 @@ DEF_PRIMITIVE(num_fromString)
   double number = strtod(string->value, &end);
 
   // Skip past any trailing whitespace.
-  while (*end != '\0' && isspace(*end)) end++;
+  while (*end != '\0' && isspace((unsigned char)*end)) end++;
 
   if (errno == ERANGE)
   {
@@ -1432,24 +1268,14 @@ DEF_PRIMITIVE(string_subscript)
   RETURN_ERROR("Subscript ranges for strings are not implemented yet.");
 }
 
-static ObjClass* defineSingleClass(WrenVM* vm, const char* name)
-{
-  ObjString* nameString = AS_STRING(wrenStringFormat(vm, "$", name));
-  wrenPushRoot(vm, (Obj*)nameString);
-
-  ObjClass* classObj = wrenNewSingleClass(vm, 0, nameString);
-  wrenDefineVariable(vm, NULL, name, nameString->length, OBJ_VAL(classObj));
-
-  wrenPopRoot(vm);
-  return classObj;
-}
-
+// Creates either the Object or Class class in the core library with [name].
 static ObjClass* defineClass(WrenVM* vm, const char* name)
 {
   ObjString* nameString = AS_STRING(wrenStringFormat(vm, "$", name));
   wrenPushRoot(vm, (Obj*)nameString);
 
-  ObjClass* classObj = wrenNewClass(vm, vm->objectClass, 0, nameString);
+  ObjClass* classObj = wrenNewSingleClass(vm, 0, nameString);
+
   wrenDefineVariable(vm, NULL, name, nameString->length, OBJ_VAL(classObj));
 
   wrenPopRoot(vm);
@@ -1460,7 +1286,7 @@ void wrenInitializeCore(WrenVM* vm)
 {
   // Define the root Object class. This has to be done a little specially
   // because it has no superclass and an unusual metaclass (Class).
-  vm->objectClass = defineSingleClass(vm, "Object");
+  vm->objectClass = defineClass(vm, "Object");
   PRIMITIVE(vm->objectClass, "!", object_not);
   PRIMITIVE(vm->objectClass, "==(_)", object_eqeq);
   PRIMITIVE(vm->objectClass, "!=(_)", object_bangeq);
@@ -1471,7 +1297,7 @@ void wrenInitializeCore(WrenVM* vm)
 
   // Now we can define Class, which is a subclass of Object, but Object's
   // metaclass.
-  vm->classClass = defineSingleClass(vm, "Class");
+  vm->classClass = defineClass(vm, "Class");
 
   // Now that Object and Class are defined, we can wire them up to each other.
   wrenBindSuperclass(vm, vm->classClass, vm->objectClass);
@@ -1504,12 +1330,14 @@ void wrenInitializeCore(WrenVM* vm)
   //     | Derived |==>| Derived.type |    |
   //     '---------'   '--------------'   -'
 
-  // The rest of the classes can not be defined normally.
-  vm->boolClass = defineClass(vm, "Bool");
+  // The rest of the classes can now be defined normally.
+  wrenInterpret(vm, "", coreLibSource);
+
+  vm->boolClass = AS_CLASS(wrenFindVariable(vm, "Bool"));
   PRIMITIVE(vm->boolClass, "toString", bool_toString);
   PRIMITIVE(vm->boolClass, "!", bool_not);
 
-  vm->fiberClass = defineClass(vm, "Fiber");
+  vm->fiberClass = AS_CLASS(wrenFindVariable(vm, "Fiber"));
   PRIMITIVE(vm->fiberClass->obj.classObj, "<instantiate>", fiber_instantiate);
   PRIMITIVE(vm->fiberClass->obj.classObj, "new(_)", fiber_new);
   PRIMITIVE(vm->fiberClass->obj.classObj, "abort(_)", fiber_abort);
@@ -1524,8 +1352,7 @@ void wrenInitializeCore(WrenVM* vm)
   PRIMITIVE(vm->fiberClass, "run(_)", fiber_run1);
   PRIMITIVE(vm->fiberClass, "try()", fiber_try);
 
-  vm->fnClass = defineClass(vm, "Fn");
-
+  vm->fnClass = AS_CLASS(wrenFindVariable(vm, "Fn"));
   PRIMITIVE(vm->fnClass->obj.classObj, "<instantiate>", fn_instantiate);
   PRIMITIVE(vm->fnClass->obj.classObj, "new(_)", fn_new);
 
@@ -1549,11 +1376,11 @@ void wrenInitializeCore(WrenVM* vm)
   PRIMITIVE(vm->fnClass, "call(_,_,_,_,_,_,_,_,_,_,_,_,_,_,_,_)", fn_call16);
   PRIMITIVE(vm->fnClass, "toString", fn_toString);
 
-  vm->nullClass = defineClass(vm, "Null");
+  vm->nullClass = AS_CLASS(wrenFindVariable(vm, "Null"));
   PRIMITIVE(vm->nullClass, "!", null_not);
   PRIMITIVE(vm->nullClass, "toString", null_toString);
 
-  vm->numClass = defineClass(vm, "Num");
+  vm->numClass = AS_CLASS(wrenFindVariable(vm, "Num"));
   PRIMITIVE(vm->numClass->obj.classObj, "fromString(_)", num_fromString);
   PRIMITIVE(vm->numClass->obj.classObj, "pi", num_pi);
   PRIMITIVE(vm->numClass, "-(_)", num_minus);
@@ -1595,8 +1422,6 @@ void wrenInitializeCore(WrenVM* vm)
   // IEEE 754 even though they have different bit representations.
   PRIMITIVE(vm->numClass, "==(_)", num_eqeq);
   PRIMITIVE(vm->numClass, "!=(_)", num_bangeq);
-
-  wrenInterpret(vm, "", libSource);
 
   vm->stringClass = AS_CLASS(wrenFindVariable(vm, "String"));
   PRIMITIVE(vm->stringClass->obj.classObj, "fromCodePoint(_)", string_fromCodePoint);

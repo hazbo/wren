@@ -1,3 +1,9 @@
+class Bool {}
+class Fiber {}
+class Fn {}
+class Null {}
+class Num {}
+
 class Sequence {
   all(f) {
     var result = true
@@ -40,21 +46,15 @@ class Sequence {
     return result
   }
 
-  map(f) {
-    var result = new List
+  each(f) {
     for (element in this) {
-      result.add(f.call(element))
+      f.call(element)
     }
-    return result
   }
 
-  where(f) {
-    var result = new List
-    for (element in this) {
-      if (f.call(element)) result.add(element)
-    }
-    return result
-  }
+  map(transformation) { new MapSequence(this, transformation) }
+
+  where(predicate) { new WhereSequence(this, predicate) }
 
   reduce(acc, f) {
     for (element in this) {
@@ -91,13 +91,39 @@ class Sequence {
     return result
   }
 
-  list {
+  toList {
     var result = new List
     for (element in this) {
       result.add(element)
     }
     return result
   }
+}
+
+class MapSequence is Sequence {
+  new(sequence, fn) {
+    _sequence = sequence
+    _fn = fn
+  }
+
+  iterate(iterator) { _sequence.iterate(iterator) }
+  iteratorValue(iterator) { _fn.call(_sequence.iteratorValue(iterator)) }
+}
+
+class WhereSequence is Sequence {
+  new(sequence, fn) {
+    _sequence = sequence
+    _fn = fn
+  }
+
+  iterate(iterator) {
+    while (iterator = _sequence.iterate(iterator)) {
+      if (_fn.call(_sequence.iteratorValue(iterator))) break
+    }
+    return iterator
+  }
+
+  iteratorValue(iterator) { _sequence.iteratorValue(iterator) }
 }
 
 class String is Sequence {
